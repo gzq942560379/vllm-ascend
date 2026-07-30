@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "container": {
+    "name": "qwen3_parallel_nightly"
+  },
+  "model": {
+    "name": "Qwen3-30B-A3B",
+    "path": "/models/Qwen3-30B-A3B",
+    "kind": "moe",
+    "served_name": "qwen3-30b-a3b-smoke",
+    "max_model_len": 4096
+  },
+  "matrix": {
+    "preset": "custom",
+    "cases": [
+      {
+        "case_id": "SMOKE_P1",
+        "pp": 2,
+        "tp": 1,
+        "ep": false,
+        "cp": 1,
+        "profile": false
+      }
+    ]
+  },
+  "workload": {
+    "input_tokens": [128],
+    "output_tokens": [16],
+    "concurrency": [1],
+    "warmup_requests": 1,
+    "repetitions": 1,
+    "requests_per_point": 2
+  },
+  "resource": {
+    "poll_seconds": 60,
+    "max_wait_seconds": 21600,
+    "max_dies": 16
+  },
+  "execution": {
+    "execution_mode": "aclgraph",
+    "profile_policy": "none",
+    "allow_service_mutation": true
+  }
+}

@@ -1,7 +1,10 @@
 #!/bin/bash
 # install_sources.sh — 在 vllm-ascend 容器内从源码安装 vllm + vllm-ascend(编出 C 扩展)
 #
-# 背景:docker.sh 把宿主源码 bind-mount 进 /vllm-workspace/{vllm,vllm-ascend},
+# 注意：独立实验包流程直接使用镜像内软件包，不要运行本脚本。
+# 本脚本只保留给手工挂载两个源码仓库的开发模式；docker.sh 不会创建以下源码挂载。
+#
+# 背景:开发模式把宿主源码 bind-mount 进 /vllm-workspace/{vllm,vllm-ascend},
 #   遮住了镜像里预编的 *.so -> vllm_ascend_C(vllm._C 同理)import 失败,
 #   vllm serve 在 model forward(layernorm -> enable_custom_op)处 ERR99999。
 #   本脚本在容器内对两仓库跑 editable 安装,把编出来的 .so 落回宿主挂载目录(持久、抗 recreate)。
@@ -18,7 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTAINER_NAME="${CONTAINER_NAME:-vllm_dynamic}"
-# 容器内源码路径(docker.sh 的 bind mount 目标)
+# 容器内源码路径（需要使用者在开发模式下手工 bind mount）
 VLLM_DIR="${VLLM_DIR:-/vllm-workspace/vllm}"
 VLLM_ASCEND_DIR="${VLLM_ASCEND_DIR:-/vllm-workspace/vllm-ascend}"
 MAX_JOBS="${MAX_JOBS:-4}"            # cmake/编译并行度;容器 nproc=1,适当抬一点
