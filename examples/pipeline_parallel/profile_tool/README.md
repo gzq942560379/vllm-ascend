@@ -22,8 +22,14 @@ Windows 休眠或 NPU 暂时被占用不会让任务丢失。控制器不会停�
 | 资源等待 | 60 秒轮询，最长 21600 秒 |
 | Windows 输出 | `D:\vllm-parallel-bench\<run_id>` |
 
-工具不会保存 SSH 密码。建议配置 OpenSSH 密钥或 `ssh-agent`；也可以在每次
-首次连接时交互输入密码。
+所有常用参数统一放在：
+
+`configs/parallel_bench_config.json`
+
+包括服务器、SSH 端口、容器、版本、模型、矩阵、工作负载、Profiling、
+远端目录和 Windows 输出目录。工具不会保存 SSH 密码。每次操作会建立一条
+OpenSSH 复用连接，因此使用密码时只输入一次；配置 OpenSSH 密钥或
+`ssh-agent` 后可以完全免输密码。
 
 ## 2. 快速矩阵
 
@@ -52,7 +58,8 @@ Windows 休眠或 NPU 暂时被占用不会让任务丢失。控制器不会停�
 Set-ExecutionPolicy -Scope Process Bypass
 cd E:\vllm\vllm-ascend\examples\pipeline_parallel\profile_tool
 
-.\parallel_bench.ps1 -Action Submit
+.\parallel_bench.ps1 -Action Submit `
+  -ConfigFile .\configs\parallel_bench_config.json
 ```
 
 输出会显示 `RunId`。提交完成后可以关闭 SSH 或 Windows 终端。
@@ -69,7 +76,7 @@ cd E:\vllm\vllm-ascend\examples\pipeline_parallel\profile_tool
 
 ```powershell
 .\parallel_bench.ps1 -Action Submit `
-  -SpecFile .\configs\qwen3_30b_a3b_smoke.json
+  -ConfigFile .\configs\qwen3_30b_a3b_smoke.json
 ```
 
 该烟测只跑 `PP=2, TP=1`、2 个短请求，不启用 Profiling。确认完整生命周期
@@ -79,17 +86,26 @@ cd E:\vllm\vllm-ascend\examples\pipeline_parallel\profile_tool
 
 ```powershell
 # 查询状态
-.\parallel_bench.ps1 -Action Status -RunId parallel-20260730-120000
+.\parallel_bench.ps1 -Action Status `
+  -ConfigFile .\configs\parallel_bench_config.json
 
 # 控制器异常退出后，从 state.json 的未完成点继续
-.\parallel_bench.ps1 -Action Resume -RunId parallel-20260730-120000
+.\parallel_bench.ps1 -Action Resume `
+  -ConfigFile .\configs\parallel_bench_config.json
 
-# 下载全部数据、trace、图表和报告到 D 盘
-.\parallel_bench.ps1 -Action Fetch -RunId parallel-20260730-120000
+# 下载到 client.output_dir
+.\parallel_bench.ps1 -Action Fetch `
+  -ConfigFile .\configs\parallel_bench_config.json
 
 # 安全请求取消；控制器会在检查点停止它自己启动的服务
-.\parallel_bench.ps1 -Action Cancel -RunId parallel-20260730-120000
+.\parallel_bench.ps1 -Action Cancel `
+  -ConfigFile .\configs\parallel_bench_config.json
 ```
+
+当 `run.run_id` 为 `auto` 时，提交成功后会在配置文件旁写入
+`<配置文件>.last-run.json`。后续 Status、Resume、Fetch 和 Cancel 自动读取
+最近一次 RunId，不必再复制到命令行。若要操作指定历史任务，可把
+`run.run_id` 改为对应值，或临时传入 `-RunId`。
 
 `state.json` 中常见状态：
 
@@ -102,16 +118,10 @@ cd E:\vllm\vllm-ascend\examples\pipeline_parallel\profile_tool
 
 ## 5. 切换模型、版本和模式
 
-模型路径、模型类型和容器都可以直接修改：
-
-```powershell
-.\parallel_bench.ps1 -Action Submit `
-  -Container qwen3_v0251 `
-  -ExpectedVllmVersion 0.25.1 `
-  -Model /models/Qwen3-8B `
-  -ModelKind dense `
-  -ExecutionMode eager
-```
+直接编辑 `configs/parallel_bench_config.json` 中的 `container`、`model` 和
+`execution`。例如将 `container.name` 改成 `qwen3_v0251`，
+`model.path` 改成 `/models/Qwen3-8B`，`model.kind` 改成 `dense`，
+`execution.execution_mode` 改成 `eager`。保存后仍只执行同一条 Submit 命令。
 
 Dense 模型会跳过 EP 点。工具启动前记录容器内 vLLM、vLLM-Ascend、PyTorch
 和 torch-npu 版本，并通过 `vllm serve --help=all` 探测参数，而不是只根据
@@ -124,9 +134,9 @@ Dense 模型会跳过 EP 点。工具启动前记录容器内 vLLM、vLLM-Ascend
 
 ## 6. 自定义 PP/TP/EP/CP
 
-默认配置文件在：
+默认可编辑配置文件在：
 
-`configs/qwen3_30b_a3b_default.json`
+`configs/parallel_bench_config.json`
 
 需要精确矩阵时，在 spec 的 `matrix.cases` 中写：
 
@@ -145,7 +155,7 @@ Dense 模型会跳过 EP 点。工具启动前记录容器内 vLLM、vLLM-Ascend
 保存为本地 JSON 后提交：
 
 ```powershell
-.\parallel_bench.ps1 -Action Submit -SpecFile .\my_parallel_spec.json
+.\parallel_bench.ps1 -Action Submit -ConfigFile .\my_parallel_spec.json
 ```
 
 CP 已进入 schema 和命令能力适配器。当容器的 `vllm serve --help=all` 没有

@@ -15,7 +15,7 @@
   },
   "container": {
     "name": "qwen3_parallel_nightly",
-    "expected_vllm_version": "",
+    "expected_vllm_version": "0.25.1",
     "expected_vllm_ascend_version": ""
   },
   "model": {
