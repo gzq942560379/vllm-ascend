@@ -12,7 +12,6 @@ pd_disaggregation_mooncake_multi_node
 long_sequence_context_parallel_single_node
 long_sequence_context_parallel_multi_node
 dynamic_chunked_pipeline_parallel
-qwen3_2d_parallel_weight_offload
 suffix_speculative_decoding
 ray
 :::
