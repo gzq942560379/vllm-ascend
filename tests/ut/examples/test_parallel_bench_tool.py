@@ -7,6 +7,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 
@@ -16,6 +17,8 @@ TOOL_DIR = (
     / "pipeline_parallel"
     / "profile_tool"
 )
+WINDOWS_LAUNCHER = TOOL_DIR / "parallel_bench.ps1"
+DEFAULT_CLIENT_CONFIG = TOOL_DIR / "configs" / "parallel_bench_config.json"
 sys.path.insert(0, str(TOOL_DIR))
 
 from benchmark_remote import (  # noqa: E402
@@ -44,6 +47,44 @@ from workload_streaming import (  # noqa: E402
     build_exact_prompt,
     percentile,
 )
+
+
+class WindowsLauncherContractTests(unittest.TestCase):
+
+    def test_editable_json_controls_connection_run_and_output(self) -> None:
+        config = json.loads(DEFAULT_CLIENT_CONFIG.read_text(encoding="utf-8"))
+
+        self.assertEqual(config["client"]["server"], "192.168.13.190")
+        self.assertEqual(config["client"]["ssh_user"], "root")
+        self.assertEqual(config["client"]["ssh_port"], 22)
+        self.assertEqual(
+            config["client"]["output_dir"], r"D:\vllm-parallel-bench"
+        )
+        self.assertEqual(
+            config["client"]["remote_project"],
+            "/home/vllm/l00977701/pipeline_parallel",
+        )
+        self.assertEqual(config["run"]["run_id"], "auto")
+        self.assertIn("workload", config)
+        self.assertIn("profiling", config)
+
+    def test_launcher_supports_one_config_file_for_every_action(self) -> None:
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+
+        self.assertIn('[string]$ConfigFile =', launcher)
+        self.assertIn("Resolve-RunId", launcher)
+        self.assertIn(".last-run.json", launcher)
+        self.assertIn('Write-Host "Config:', launcher)
+        self.assertNotIn("-RunId is required for $Action", launcher)
+
+    def test_launcher_reuses_one_authenticated_ssh_connection(self) -> None:
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+
+        self.assertIn("ControlMaster=auto", launcher)
+        self.assertIn("ControlPersist=", launcher)
+        self.assertIn("ControlPath=", launcher)
+        self.assertIn("Open-SshMaster", launcher)
+        self.assertIn("Close-SshMaster", launcher)
 
 
 class ExperimentSchemaTests(unittest.TestCase):
