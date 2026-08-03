@@ -362,7 +362,10 @@ function Close-SshMaster {
 
 function Invoke-Ssh {
     param([Parameter(Mandatory = $true)][string]$Command)
-    & ssh @sshArgs $target $Command
+    $commandBytes = [Text.Encoding]::UTF8.GetBytes($Command)
+    $encodedCommand = [Convert]::ToBase64String($commandBytes)
+    $remoteCommand = "printf %s $encodedCommand | base64 -d | bash"
+    & ssh @sshArgs $target $remoteCommand
     if ($LASTEXITCODE -ne 0) {
         throw "Remote command failed with exit code $LASTEXITCODE."
     }
