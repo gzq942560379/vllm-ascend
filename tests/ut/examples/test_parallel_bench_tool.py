@@ -20,6 +20,8 @@ TOOL_DIR = (
     / "profile_tool"
 )
 WINDOWS_LAUNCHER = TOOL_DIR / "parallel_bench.ps1"
+DOCKER_SCRIPT = TOOL_DIR.parent / "docker.sh"
+REMOTE_CONTROLLER = TOOL_DIR / "benchmark_remote.py"
 DEFAULT_CLIENT_CONFIG = TOOL_DIR / "configs" / "parallel_bench_config.json"
 SMOKE_CONFIG = TOOL_DIR / "configs" / "qwen3_30b_a3b_smoke.json"
 sys.path.insert(0, str(TOOL_DIR))
@@ -103,6 +105,17 @@ class WindowsLauncherContractTests(unittest.TestCase):
             '[ValidateSet("quick", "boundary", "custom")]', launcher
         )
 
+    def test_submit_mounts_host_model_at_container_models(self) -> None:
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+        docker_script = DOCKER_SCRIPT.read_text(encoding="utf-8")
+        controller = REMOTE_CONTROLLER.read_text(encoding="utf-8")
+
+        self.assertIn('MODEL_DIR=\'$Model\'', launcher)
+        self.assertIn('"$remoteDocker\' restart"', launcher)
+        self.assertIn('-v "${MODEL_DIR}:/models"', docker_script)
+        self.assertIn('SERVE_MODEL="${SERVE_MODEL:-/models}"', docker_script)
+        self.assertIn('str(model["container_path"])', controller)
+
     @unittest.skipUnless(shutil.which("powershell"), "PowerShell is required")
     def test_smoke_custom_config_completes_dry_run(self) -> None:
         completed = subprocess.run(
@@ -162,6 +175,7 @@ class ExperimentSchemaTests(unittest.TestCase):
     def test_default_spec_and_quick_matrix(self) -> None:
         spec = default_spec()
         self.assertEqual(spec["model"]["path"], DEFAULT_MODEL_PATH)
+        self.assertEqual(spec["model"]["container_path"], "/models")
         self.assertEqual(spec["model"]["kind"], "moe")
         self.assertEqual(spec["resource"]["max_wait_seconds"], 6 * 60 * 60)
 
