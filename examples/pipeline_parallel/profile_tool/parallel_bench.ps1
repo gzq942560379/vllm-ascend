@@ -388,6 +388,20 @@ function Invoke-Scp {
     }
 }
 
+function Write-LfCopy {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    $content = [IO.File]::ReadAllText($Source)
+    $normalized = $content.Replace("`r`n", "`n").Replace("`r", "`n")
+    [IO.File]::WriteAllText(
+        $Destination,
+        $normalized,
+        [Text.UTF8Encoding]::new($false)
+    )
+}
+
 Open-SshMaster
 try {
     switch ($Action) {
@@ -438,7 +452,11 @@ try {
     }
 
     $temporarySpec = Join-Path ([IO.Path]::GetTempPath()) "$RunId-spec.json"
+    $temporaryDocker = Join-Path ([IO.Path]::GetTempPath()) "$RunId-docker.sh"
+    $temporarySelector = Join-Path ([IO.Path]::GetTempPath()) "$RunId-find-idle.sh"
     try {
+        Write-LfCopy -Source $dockerScript -Destination $temporaryDocker
+        Write-LfCopy -Source $selectorScript -Destination $temporarySelector
         [IO.File]::WriteAllText(
             $temporarySpec,
             ($spec | ConvertTo-Json -Depth 20),
@@ -449,10 +467,10 @@ try {
         $upload = @($requiredFiles | ForEach-Object { Join-Path $toolDir $_ })
         Invoke-Scp -Arguments @($upload + "${target}:$remoteTool/")
         Invoke-Scp -Arguments @(
-            $selectorScript,
+            $temporarySelector,
             "${target}:$RemoteProject/find_idle_npu.sh"
         )
-        Invoke-Scp -Arguments @($dockerScript, "${target}:$remoteDocker")
+        Invoke-Scp -Arguments @($temporaryDocker, "${target}:$remoteDocker")
         Invoke-Ssh "chmod +x '$RemoteProject/find_idle_npu.sh' '$remoteDocker'"
         Invoke-Scp -Arguments @($temporarySpec, "${target}:$remoteSpec")
 
@@ -482,7 +500,11 @@ try {
         Write-Host "Status: .\parallel_bench.ps1 -Action Status -ConfigFile `"$configPath`""
         Write-Host "Fetch:  .\parallel_bench.ps1 -Action Fetch -ConfigFile `"$configPath`""
     } finally {
-        Remove-Item -LiteralPath $temporarySpec -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath @(
+            $temporarySpec,
+            $temporaryDocker,
+            $temporarySelector
+        ) -Force -ErrorAction SilentlyContinue
     }
 } finally {
     Close-SshMaster
