@@ -15,7 +15,7 @@ Windows 休眠或 NPU 暂时被占用不会让任务丢失。控制器不会停�
 |---|---|
 | 服务器 | `192.168.13.190` |
 | 容器 | `qwen3_parallel_nightly` |
-| 模型 | `/models/Qwen3-30B-A3B` |
+| 宿主机模型 | `/home/vllm/l00977701/models/Qwen3-30B-A3B` |
 | 模型类型 | Qwen3 MoE |
 | 执行模式 | ACLGraph |
 | NPU | 8 张 910B、最多 16 个 die |
@@ -120,8 +120,14 @@ cd E:\vllm\vllm-ascend\examples\pipeline_parallel\profile_tool
 
 直接编辑 `configs/parallel_bench_config.json` 中的 `container`、`model` 和
 `execution`。例如将 `container.name` 改成 `qwen3_v0251`，
-`model.path` 改成 `/models/Qwen3-8B`，`model.kind` 改成 `dense`，
+`model.path` 改成宿主机完整路径
+`/home/vllm/l00977701/models/Qwen3-8B`，`model.kind` 改成 `dense`，
 `execution.execution_mode` 改成 `eager`。保存后仍只执行同一条 Submit 命令。
+
+Submit 会先确认宿主机模型目录中存在 `config.json`，然后重建配置中的测试
+容器，将 `model.path` 直接挂载到容器 `/models`。控制器始终执行
+`vllm serve /models`。重建会替换同名容器，提交前必须确认该容器没有承载
+其他人的任务。
 
 Dense 模型会跳过 EP 点。工具启动前记录容器内 vLLM、vLLM-Ascend、PyTorch
 和 torch-npu 版本，并通过 `vllm serve --help=all` 探测参数，而不是只根据

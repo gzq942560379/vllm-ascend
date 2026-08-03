@@ -111,9 +111,10 @@ class WindowsLauncherContractTests(unittest.TestCase):
         controller = REMOTE_CONTROLLER.read_text(encoding="utf-8")
 
         self.assertIn('MODEL_DIR=\'$Model\'', launcher)
-        self.assertIn('"$remoteDocker\' restart"', launcher)
+        self.assertIn("MODEL_DIR='$Model' '$remoteDocker' restart", launcher)
         self.assertIn('-v "${MODEL_DIR}:/models"', docker_script)
         self.assertIn('SERVE_MODEL="${SERVE_MODEL:-/models}"', docker_script)
+        self.assertIn("cmd_restart() {\n  validate_model_dir", docker_script)
         self.assertIn('str(model["container_path"])', controller)
 
     @unittest.skipUnless(shutil.which("powershell"), "PowerShell is required")

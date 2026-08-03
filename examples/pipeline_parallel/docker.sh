@@ -19,7 +19,7 @@ BASE_DIR="${BASE_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 BUNDLE_DIR="${BUNDLE_DIR:-${SCRIPT_DIR}}"
 RUNTIME_DIR="${RUNTIME_DIR:-${BASE_DIR}/runtime}"
 WORK_DIR="${WORK_DIR:-/workspace}"
-MODEL_DIR="${MODEL_DIR:-${BASE_DIR}/models}"
+MODEL_DIR="${MODEL_DIR:-${BASE_DIR}/models/Qwen3-8B}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-${BASE_DIR}/huggingface-cache}"
 # 仅 NPU_MODE=static 时使用（示例：NPU3 双 die -> logic 6,7）
 ASCEND_DEVICES="${ASCEND_DEVICES:-6,7}"
@@ -39,7 +39,7 @@ else
 fi
 
 # vllm serve 默认参数（serve 子命令用）
-SERVE_MODEL="${SERVE_MODEL:-/models/Qwen3-8B}"
+SERVE_MODEL="${SERVE_MODEL:-/models}"
 SERVE_TP="${SERVE_TP:-1}"                 # 自动选卡挑几个 die(tp)
 SERVE_PICK_FLAGS="${SERVE_PICK_FLAGS:---wait}"  # find_idle_npu.sh 选卡参数;默认 --wait 无空闲时阻塞等(find_idle_npu 永远 strict)
 FIND_IDLE_NPU="${FIND_IDLE_NPU:-${SCRIPT_DIR}/find_idle_npu.sh}"
@@ -79,7 +79,7 @@ NPU binding (默认 dynamic):
   NPU_MODE=static ASCEND_DEVICES=6,7 RECREATE=1 ./docker.sh restart
 
 serve:
-  SERVE_MODEL=/models/Qwen3-8B ./docker.sh serve
+  SERVE_MODEL=/models ./docker.sh serve
   # 永远用 find_idle_npu.sh 自动选空闲卡(strict,无进程的 die),无空闲则 --wait 阻塞等。不手动指定卡。
   #   SERVE_TP=2 ./docker.sh serve                       # 挑 2 个 die(tp=2)
   #   SERVE_PICK_FLAGS="--wait-seconds 30" ./docker.sh serve  # 自定义等待轮询
@@ -90,10 +90,18 @@ EOF
 container_exists() { docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; }
 container_running() { docker ps --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; }
 
+validate_model_dir() {
+  if [[ ! -s "${MODEL_DIR}/config.json" ]]; then
+    echo "Model config not found on host: ${MODEL_DIR}/config.json" >&2
+    exit 1
+  fi
+}
+
 create_container() {
   local device_args=() env_args=()
 
-  mkdir -p "${RUNTIME_DIR}" "${MODEL_DIR}" "${HF_CACHE_DIR}"
+  mkdir -p "${RUNTIME_DIR}" "${HF_CACHE_DIR}"
+  validate_model_dir
 
   case "${NPU_MODE}" in
     static)
@@ -156,6 +164,7 @@ ensure_running() {
 cmd_shell() { ensure_running; exec docker exec -it -e "HOME=${WORK_DIR}" -w "${WORK_DIR}" "${CONTAINER_NAME}" bash -i; }
 cmd_start() { ensure_running; echo "Container '${CONTAINER_NAME}' is running (image: ${IMAGE})."; }
 cmd_restart() {
+  validate_model_dir
   if container_exists; then echo "Removing existing container: ${CONTAINER_NAME}"; docker rm -f "${CONTAINER_NAME}"; fi
   create_container; echo "Container '${CONTAINER_NAME}' recreated (image: ${IMAGE})."
 }

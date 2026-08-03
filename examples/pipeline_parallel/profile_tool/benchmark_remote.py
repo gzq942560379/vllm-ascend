@@ -308,7 +308,7 @@ class RemoteController:
         return 1 if failures or unfinished else 0
 
     def _validate_environment(self, container: str) -> None:
-        model_path = str(self.spec["model"]["path"])
+        model_path = str(self.spec["model"]["container_path"])
         check = _docker_exec(
             container,
             ["test", "-s", f"{model_path}/config.json"],
@@ -364,6 +364,7 @@ class RemoteController:
         )
         versions = environment.get("versions", {})
         environment["model"] = {
+            "host_path": str(self.spec["model"]["path"]),
             "path": model_path,
             "kind": actual_kind,
             **model_metadata,
@@ -511,7 +512,7 @@ class RemoteController:
         command = [
             "vllm",
             "serve",
-            str(model["path"]),
+            str(model["container_path"]),
             "--served-model-name",
             served_name,
             "--distributed-executor-backend",

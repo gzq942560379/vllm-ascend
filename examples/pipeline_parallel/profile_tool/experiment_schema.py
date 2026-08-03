@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-DEFAULT_MODEL_PATH = "/models/Qwen3-30B-A3B"
+DEFAULT_MODEL_PATH = "/home/vllm/l00977701/models/Qwen3-30B-A3B"
 MAX_ASCEND_DIES = 16
 
 
@@ -102,6 +102,7 @@ def default_spec() -> dict[str, Any]:
         "model": {
             "name": "Qwen3-30B-A3B",
             "path": DEFAULT_MODEL_PATH,
+            "container_path": "/models",
             "kind": "moe",
             "served_name": "qwen3-30b-a3b-parallel-bench",
             "max_model_len": 4096,
@@ -165,7 +166,10 @@ def _deep_merge(target: dict[str, Any], source: Mapping[str, Any]) -> None:
 def validate_spec(spec: Mapping[str, Any]) -> None:
     model_path = str(spec["model"]["path"])
     if not model_path.startswith("/") or "\x00" in model_path:
-        raise ValueError("model.path must be an absolute container path")
+        raise ValueError("model.path must be an absolute host path")
+    container_path = str(spec["model"].get("container_path", "/models"))
+    if not container_path.startswith("/") or "\x00" in container_path:
+        raise ValueError("model.container_path must be absolute")
     max_dies = int(spec["resource"]["max_dies"])
     if not 1 <= max_dies <= MAX_ASCEND_DIES:
         raise ValueError(f"resource.max_dies must be in [1, {MAX_ASCEND_DIES}]")

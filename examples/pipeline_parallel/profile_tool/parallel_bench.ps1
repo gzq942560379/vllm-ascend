@@ -16,7 +16,7 @@ param(
     [string]$RemoteProject = "/home/vllm/l00977701/pipeline_parallel",
     [string]$RemoteRunRoot = "/home/vllm/l00977701/runtime/parallel_bench_runs",
     [string]$Container = "qwen3_parallel_nightly",
-    [string]$Model = "/models/Qwen3-30B-A3B",
+    [string]$Model = "/home/vllm/l00977701/models/Qwen3-30B-A3B",
     [ValidateSet("moe", "dense", "auto")]
     [string]$ModelKind = "moe",
     [ValidateSet("quick", "boundary", "custom")]
@@ -50,6 +50,7 @@ param(
 $ErrorActionPreference = "Stop"
 $script:CliParameters = @{} + $PSBoundParameters
 $toolDir = $PSScriptRoot
+$dockerScript = Join-Path (Split-Path $PSScriptRoot -Parent) "docker.sh"
 $selectorScript = Join-Path (Split-Path $PSScriptRoot -Parent) "find_idle_npu.sh"
 $requiredFiles = @(
     "benchmark_remote.py",
@@ -242,12 +243,19 @@ if ($RunId -notmatch "^[A-Za-z0-9][A-Za-z0-9_.-]*$") {
 if ($SshPort -lt 1 -or $SshPort -gt 65535) {
     throw "client.ssh_port must be between 1 and 65535."
 }
+if ($Model -notmatch "^/[A-Za-z0-9._/-]+$") {
+    throw "model.path must be a safe absolute host path without spaces."
+}
+if ($Container -notmatch "^[A-Za-z0-9][A-Za-z0-9_.-]*$") {
+    throw "container.name contains unsafe characters."
+}
 
 $target = "${SshUser}@${Server}"
 $remoteTool = "$RemoteProject/profile_tool"
 $remoteRun = "$RemoteRunRoot/$RunId"
 $remoteSpec = "$remoteRun/spec.json"
 $remoteController = "$remoteTool/benchmark_remote.py"
+$remoteDocker = "$RemoteProject/docker.sh"
 $persistSeconds = [int](Get-OptionalProperty $client "ssh_control_persist_seconds" 600)
 if ($persistSeconds -lt 30 -or $persistSeconds -gt 86400) {
     throw "client.ssh_control_persist_seconds must be between 30 and 86400."
@@ -272,6 +280,7 @@ $spec.container | Add-Member -Force -NotePropertyName "expected_vllm_version" `
 $spec.container | Add-Member -Force -NotePropertyName "expected_vllm_ascend_version" `
     -NotePropertyValue $ExpectedVllmAscendVersion
 $spec.model | Add-Member -Force -NotePropertyName "path" -NotePropertyValue $Model
+$spec.model | Add-Member -Force -NotePropertyName "container_path" -NotePropertyValue "/models"
 $spec.model | Add-Member -Force -NotePropertyName "kind" -NotePropertyValue $ModelKind
 $spec.matrix | Add-Member -Force -NotePropertyName "preset" -NotePropertyValue $Matrix
 $spec.workload | Add-Member -Force -NotePropertyName "input_tokens" `
@@ -424,6 +433,9 @@ try {
     if (-not (Test-Path -LiteralPath $selectorScript -PathType Leaf)) {
         throw "Missing bundled selector: $selectorScript"
     }
+    if (-not (Test-Path -LiteralPath $dockerScript -PathType Leaf)) {
+        throw "Missing bundled Docker launcher: $dockerScript"
+    }
 
     $temporarySpec = Join-Path ([IO.Path]::GetTempPath()) "$RunId-spec.json"
     try {
@@ -440,10 +452,15 @@ try {
             $selectorScript,
             "${target}:$RemoteProject/find_idle_npu.sh"
         )
-        Invoke-Ssh "chmod +x '$RemoteProject/find_idle_npu.sh'"
+        Invoke-Scp -Arguments @($dockerScript, "${target}:$remoteDocker")
+        Invoke-Ssh "chmod +x '$RemoteProject/find_idle_npu.sh' '$remoteDocker'"
         Invoke-Scp -Arguments @($temporarySpec, "${target}:$remoteSpec")
 
-        Write-Host "[2/3] Launching the controller with nohup ..."
+        Write-Host "[2/3] Recreating the test container with the configured model ..."
+        $containerCommand = "CONTAINER_NAME='$Container' MODEL_DIR='$Model' '$remoteDocker' restart"
+        Invoke-Ssh $containerCommand
+
+        Write-Host "[3/3] Launching the controller with nohup ..."
         $launch = "cd '$remoteTool' && " +
             "nohup python3 '$remoteController' --run-dir '$remoteRun' --spec '$remoteSpec' " +
             "> '$remoteRun/controller.log' 2>&1 < /dev/null & echo `$! > '$remoteRun/controller.pid'"
@@ -461,7 +478,7 @@ try {
             ($lastRun | ConvertTo-Json),
             [Text.UTF8Encoding]::new($false)
         )
-        Write-Host "[3/3] Submitted. SSH can disconnect without stopping the task."
+        Write-Host "Submitted. SSH can disconnect without stopping the task."
         Write-Host "Status: .\parallel_bench.ps1 -Action Status -ConfigFile `"$configPath`""
         Write-Host "Fetch:  .\parallel_bench.ps1 -Action Fetch -ConfigFile `"$configPath`""
     } finally {

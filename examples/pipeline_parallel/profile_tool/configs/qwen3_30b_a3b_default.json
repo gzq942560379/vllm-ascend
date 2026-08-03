@@ -20,7 +20,8 @@
   },
   "model": {
     "name": "Qwen3-30B-A3B",
-    "path": "/models/Qwen3-30B-A3B",
+    "path": "/home/vllm/l00977701/models/Qwen3-30B-A3B",
+    "container_path": "/models",
     "kind": "moe",
     "served_name": "qwen3-30b-a3b-parallel-bench",
     "max_model_len": 4096
