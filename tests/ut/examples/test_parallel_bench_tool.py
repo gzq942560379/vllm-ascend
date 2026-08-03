@@ -31,6 +31,7 @@ from experiment_schema import (  # noqa: E402
     CapabilitySet,
     default_spec,
     expand_boundary_matrix,
+    expand_cases,
     expand_quick_matrix,
     render_parallel_flags,
 )
@@ -86,8 +87,43 @@ class WindowsLauncherContractTests(unittest.TestCase):
         self.assertIn("Open-SshMaster", launcher)
         self.assertIn("Close-SshMaster", launcher)
 
+    def test_launcher_accepts_custom_matrix_from_json(self) -> None:
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+
+        self.assertIn(
+            '[ValidateSet("quick", "boundary", "custom")]', launcher
+        )
+
 
 class ExperimentSchemaTests(unittest.TestCase):
+
+    def test_custom_matrix_requires_explicit_cases(self) -> None:
+        spec = default_spec()
+        spec["matrix"] = {"preset": "custom", "cases": []}
+
+        with self.assertRaisesRegex(ValueError, "custom.*case"):
+            expand_cases(spec)
+
+    def test_custom_matrix_uses_explicit_cases(self) -> None:
+        spec = default_spec()
+        spec["matrix"] = {
+            "preset": "custom",
+            "cases": [
+                {
+                    "case_id": "SMOKE_P1",
+                    "pp": 2,
+                    "tp": 1,
+                    "ep": False,
+                    "cp": 1,
+                    "profile": False,
+                }
+            ],
+        }
+
+        cases = expand_cases(spec)
+
+        self.assertEqual([case.case_id for case in cases], ["SMOKE_P1"])
+        self.assertEqual(cases[0].world_size, 2)
 
     def test_default_spec_and_quick_matrix(self) -> None:
         spec = default_spec()
