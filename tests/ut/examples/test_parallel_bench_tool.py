@@ -90,6 +90,12 @@ class WindowsLauncherContractTests(unittest.TestCase):
         self.assertIn("Open-SshMaster", launcher)
         self.assertIn("Close-SshMaster", launcher)
 
+    def test_launcher_encodes_remote_commands_before_ssh(self) -> None:
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+
+        self.assertIn("[Convert]::ToBase64String", launcher)
+        self.assertIn("| base64 -d | bash", launcher)
+
     def test_launcher_accepts_custom_matrix_from_json(self) -> None:
         launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
 
