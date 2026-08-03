@@ -213,6 +213,7 @@ def expand_boundary_matrix(spec: Mapping[str, Any]) -> list[ParallelCase]:
 
 
 def expand_cases(spec: Mapping[str, Any]) -> list[ParallelCase]:
+    preset = str(spec["matrix"].get("preset", "quick"))
     explicit = spec["matrix"].get("cases", [])
     if explicit:
         cases = [
@@ -226,7 +227,9 @@ def expand_cases(spec: Mapping[str, Any]) -> list[ParallelCase]:
             )
             for item in explicit
         ]
-    elif spec["matrix"].get("preset") == "boundary":
+    elif preset == "custom":
+        raise ValueError("custom matrix preset requires at least one case")
+    elif preset == "boundary":
         cases = expand_boundary_matrix(spec)
     else:
         cases = expand_quick_matrix(spec)

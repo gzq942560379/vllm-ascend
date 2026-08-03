@@ -19,7 +19,7 @@ param(
     [string]$Model = "/models/Qwen3-30B-A3B",
     [ValidateSet("moe", "dense", "auto")]
     [string]$ModelKind = "moe",
-    [ValidateSet("quick", "boundary")]
+    [ValidateSet("quick", "boundary", "custom")]
     [string]$Matrix = "quick",
     [ValidateSet("eager", "aclgraph")]
     [string]$ExecutionMode = "aclgraph",
@@ -259,6 +259,9 @@ $spec.PSObject.Properties.Remove("client")
 $spec.PSObject.Properties.Remove("run")
 if ($null -eq $spec.PSObject.Properties["server"]) {
     $spec | Add-Member -NotePropertyName "server" -NotePropertyValue ([pscustomobject]@{})
+}
+if ($null -eq $spec.PSObject.Properties["profiling"]) {
+    $spec | Add-Member -NotePropertyName "profiling" -NotePropertyValue ([pscustomobject]@{})
 }
 $spec.server | Add-Member -Force -NotePropertyName "host" -NotePropertyValue $Server
 $spec.server | Add-Member -Force -NotePropertyName "ssh_user" -NotePropertyValue $SshUser

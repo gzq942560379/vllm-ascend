@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -19,6 +21,7 @@ TOOL_DIR = (
 )
 WINDOWS_LAUNCHER = TOOL_DIR / "parallel_bench.ps1"
 DEFAULT_CLIENT_CONFIG = TOOL_DIR / "configs" / "parallel_bench_config.json"
+SMOKE_CONFIG = TOOL_DIR / "configs" / "qwen3_30b_a3b_smoke.json"
 sys.path.insert(0, str(TOOL_DIR))
 
 from benchmark_remote import (  # noqa: E402
@@ -93,6 +96,31 @@ class WindowsLauncherContractTests(unittest.TestCase):
         self.assertIn(
             '[ValidateSet("quick", "boundary", "custom")]', launcher
         )
+
+    @unittest.skipUnless(shutil.which("powershell"), "PowerShell is required")
+    def test_smoke_custom_config_completes_dry_run(self) -> None:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(WINDOWS_LAUNCHER),
+                "-Action",
+                "Submit",
+                "-ConfigFile",
+                str(SMOKE_CONFIG),
+                "-DryRun",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn('"preset":  "custom"', completed.stdout)
+        self.assertIn('"case_id":  "SMOKE_P1"', completed.stdout)
 
 
 class ExperimentSchemaTests(unittest.TestCase):
