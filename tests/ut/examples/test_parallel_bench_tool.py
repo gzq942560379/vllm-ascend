@@ -117,6 +117,14 @@ class WindowsLauncherContractTests(unittest.TestCase):
         self.assertIn("cmd_restart() {\n  validate_model_dir", docker_script)
         self.assertIn('str(model["container_path"])', controller)
 
+    def test_launcher_normalizes_shell_scripts_before_upload(self) -> None:
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+
+        self.assertIn("function Write-LfCopy", launcher)
+        self.assertIn('.Replace("`r`n", "`n")', launcher)
+        self.assertIn("$temporaryDocker", launcher)
+        self.assertIn("$temporarySelector", launcher)
+
     @unittest.skipUnless(shutil.which("powershell"), "PowerShell is required")
     def test_smoke_custom_config_completes_dry_run(self) -> None:
         completed = subprocess.run(
