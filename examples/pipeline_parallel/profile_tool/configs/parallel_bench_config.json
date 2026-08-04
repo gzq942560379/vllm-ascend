@@ -42,7 +42,16 @@
     "input_tokens": 512,
     "output_tokens": 64,
     "num_requests": 16,
-    "concurrency": 4
+    "concurrency": 4,
+    "trace_mode": "full",
+    "exclude_tracks": [],
+    "scopes": {
+      "forward": true,
+      "prefill": true,
+      "decode": true,
+      "chunked_prefill": true,
+      "spec_decode": true
+    }
   },
   "resource": {
     "poll_seconds": 60,

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -22,23 +23,41 @@ TOOL_DIR = (
 WINDOWS_LAUNCHER = TOOL_DIR / "parallel_bench.ps1"
 DOCKER_SCRIPT = TOOL_DIR.parent / "docker.sh"
 REMOTE_CONTROLLER = TOOL_DIR / "benchmark_remote.py"
+STANDALONE_REMOTE_PROFILER = TOOL_DIR / "profile_remote.py"
+PROFILE_SCOPE_INSTALLER = TOOL_DIR / "install_profile_scopes.py"
+MODEL_RUNNER = (
+    Path(__file__).resolve().parents[3]
+    / "vllm_ascend"
+    / "worker"
+    / "model_runner_v1.py"
+)
 DEFAULT_CLIENT_CONFIG = TOOL_DIR / "configs" / "parallel_bench_config.json"
 SMOKE_CONFIG = TOOL_DIR / "configs" / "qwen3_30b_a3b_smoke.json"
+QWEN3_8B_SMOKE_CONFIG = TOOL_DIR / "configs" / "qwen3_8b_smoke.json"
 sys.path.insert(0, str(TOOL_DIR))
 
 from benchmark_remote import (  # noqa: E402
     CaseStatus,
     ExperimentState,
+    MERGED_TRACE_NAME,
+    merge_trace_view_files,
     runnable_case_ids,
+)
+from install_profile_scopes import (  # noqa: E402
+    patch_envs_source,
+    patch_runner_source,
 )
 from experiment_schema import (  # noqa: E402
     DEFAULT_MODEL_PATH,
+    PROFILE_SCOPE_NAMES,
     CapabilitySet,
     default_spec,
+    enabled_profile_scopes,
     expand_boundary_matrix,
     expand_cases,
     expand_quick_matrix,
     render_parallel_flags,
+    validate_spec,
 )
 from metrics_analyzer import (  # noqa: E402
     analyze_bubbles,
@@ -83,20 +102,60 @@ class WindowsLauncherContractTests(unittest.TestCase):
         self.assertIn('Write-Host "Config:', launcher)
         self.assertNotIn("-RunId is required for $Action", launcher)
 
-    def test_launcher_reuses_one_authenticated_ssh_connection(self) -> None:
+    def test_launcher_batches_windows_submit_without_ssh_multiplexing(self) -> None:
         launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+        smoke_config = json.loads(
+            QWEN3_8B_SMOKE_CONFIG.read_text(encoding="utf-8")
+        )
 
         self.assertIn("ControlMaster=auto", launcher)
         self.assertIn("ControlPersist=", launcher)
         self.assertIn("ControlPath=", launcher)
         self.assertIn("Open-SshMaster", launcher)
         self.assertIn("Close-SshMaster", launcher)
+        self.assertIn('$env:OS -eq "Windows_NT"', launcher)
+        self.assertIn("Win32 OpenSSH", launcher)
+        self.assertIn("$temporaryArchive", launcher)
+        self.assertIn("uploading bundled benchmark payload", launcher)
+        self.assertIn("password prompt 1/2", launcher)
+        self.assertIn("password prompt 2/2", launcher)
+        self.assertFalse(smoke_config["client"]["ssh_multiplexing"])
+        self.assertEqual(
+            smoke_config["client"]["ssh_connect_timeout_seconds"], 15
+        )
+        self.assertEqual(
+            smoke_config["client"]["remote_command_timeout_seconds"], 600
+        )
+
+    def test_launcher_times_out_failed_connections_and_remote_steps(self) -> None:
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+
+        self.assertIn("ConnectTimeout=", launcher)
+        self.assertIn("ServerAliveInterval=", launcher)
+        self.assertIn("ServerAliveCountMax=", launcher)
+        self.assertIn("timeout --foreground", launcher)
+        self.assertIn("timed out after", launcher)
+        self.assertIn('-Operation "running remote submit workflow"', launcher)
+
+    def test_fetch_packages_only_merged_profile_traces(self) -> None:
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+
+        self.assertIn("-path '$RunId/profiles' -prune", launcher)
+        self.assertIn("-name 'merged_trace_view.json'", launcher)
+        self.assertIn("tar --null --files-from=", launcher)
+        self.assertIn("sleep 3600; rm -f $remoteFetchArchive", launcher)
+        self.assertIn("Profiles: merged_trace_view.json only", launcher)
+        self.assertNotIn(
+            'Invoke-Scp -Arguments @("-r", "${target}:$remoteRun"',
+            launcher,
+        )
 
     def test_launcher_encodes_remote_commands_before_ssh(self) -> None:
         launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
 
         self.assertIn("[Convert]::ToBase64String", launcher)
-        self.assertIn("| base64 -d | bash", launcher)
+        self.assertIn("| base64 -d |", launcher)
+        self.assertIn("timeout --foreground ${TimeoutSeconds}s bash", launcher)
 
     def test_launcher_accepts_custom_matrix_from_json(self) -> None:
         launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
@@ -138,7 +197,7 @@ class WindowsLauncherContractTests(unittest.TestCase):
                 "-Action",
                 "Submit",
                 "-ConfigFile",
-                str(SMOKE_CONFIG),
+                str(QWEN3_8B_SMOKE_CONFIG),
                 "-DryRun",
             ],
             check=False,
@@ -150,8 +209,181 @@ class WindowsLauncherContractTests(unittest.TestCase):
         self.assertIn('"preset":  "custom"', completed.stdout)
         self.assertIn('"case_id":  "SMOKE_P1"', completed.stdout)
 
+    @unittest.skipUnless(
+        os.name == "nt" and shutil.which("powershell"),
+        "Windows PowerShell is required",
+    )
+    def test_windows_submit_uses_one_scp_and_one_ssh_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mock_bin = root / "bin"
+            mock_bin.mkdir()
+            ssh_log = root / "ssh.log"
+            scp_log = root / "scp.log"
+            (mock_bin / "ssh.cmd").write_text(
+                '@echo off\r\necho %*>>"%VPB_SSH_LOG%"\r\nexit /b 0\r\n',
+                encoding="utf-8",
+            )
+            (mock_bin / "scp.cmd").write_text(
+                '@echo off\r\necho %*>>"%VPB_SCP_LOG%"\r\nexit /b 0\r\n',
+                encoding="utf-8",
+            )
+            config = json.loads(
+                QWEN3_8B_SMOKE_CONFIG.read_text(encoding="utf-8")
+            )
+            config["client"]["output_dir"] = str(root / "output")
+            config_path = root / "qwen3_8b_smoke.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            environment = os.environ.copy()
+            environment["PATH"] = str(mock_bin) + os.pathsep + environment["PATH"]
+            environment["VPB_SSH_LOG"] = str(ssh_log)
+            environment["VPB_SCP_LOG"] = str(scp_log)
+
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(WINDOWS_LAUNCHER),
+                    "-Action",
+                    "Submit",
+                    "-ConfigFile",
+                    str(config_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(len(scp_log.read_text().splitlines()), 1)
+            self.assertEqual(len(ssh_log.read_text().splitlines()), 1)
+            self.assertIn("password prompt 1/2", completed.stdout)
+            self.assertIn("password prompt 2/2", completed.stdout)
+
+
+class HighLevelProfileScopeContractTests(unittest.TestCase):
+
+    def test_submit_installs_scopes_into_the_image_runtime(self) -> None:
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+
+        self.assertIn('"install_profile_scopes.py"', launcher)
+        self.assertIn(
+            "docker exec '$Container' python3 ", launcher
+        )
+        self.assertIn(
+            "/workspace/pipeline_parallel/profile_tool/"
+            "install_profile_scopes.py",
+            launcher,
+        )
+
+    def test_runtime_installer_patches_old_image_sources(self) -> None:
+        envs_source = '''import os
+env_variables = {
+    "EXISTING": lambda: 1,
+}
+# end-env-vars-definition
+'''
+        runner_source = '''from contextlib import nullcontext
+from typing import NamedTuple
+from vllm_ascend.ascend_config import get_ascend_config
+
+class ExecuteModelState(NamedTuple):
+    value: int
+
+def execute(self):
+    with (
+            record_function_or_nullcontext("forward"),
+    ):
+        pass
+'''
+
+        patched_envs = patch_envs_source(envs_source)
+        patched_runner = patch_runner_source(runner_source)
+
+        self.assertIn("VLLM_ASCEND_PROFILING_SCOPES", patched_envs)
+        self.assertIn("from vllm_ascend import envs as envs_ascend", patched_runner)
+        self.assertIn("_forward_profile_scope(self.attn_state)", patched_runner)
+        compile(patched_envs, "envs.py", "exec")
+        compile(patched_runner, "model_runner_v1.py", "exec")
+
+    def test_parallel_launcher_passes_only_configured_scopes(self) -> None:
+        source = REMOTE_CONTROLLER.read_text(encoding="utf-8")
+
+        self.assertIn("VLLM_CUSTOM_SCOPES_FOR_PROFILING=1", source)
+        self.assertIn("VLLM_ASCEND_PROFILING_SCOPES=", source)
+        self.assertIn("enabled_profile_scopes(self.spec)", source)
+
+    def test_model_forward_has_nested_semantic_scopes(self) -> None:
+        source = MODEL_RUNNER.read_text(encoding="utf-8")
+
+        self.assertIn('_forward_profile_context("forward")', source)
+        self.assertIn("_forward_profile_scope(self.attn_state)", source)
+        self.assertIn("ENABLED_FORWARD_PROFILE_SCOPES", source)
+        for scope in (
+            'return "prefill"',
+            'return "decode"',
+            'return "chunked_prefill"',
+            'return "spec_decode"',
+        ):
+            self.assertIn(scope, source)
+
+    def test_8b_smoke_keeps_only_forward_cpu_scope(self) -> None:
+        config = json.loads(
+            QWEN3_8B_SMOKE_CONFIG.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(config["profiling"]["trace_mode"], "scopes_only")
+        enabled = [
+            name
+            for name, value in config["profiling"]["scopes"].items()
+            if value
+        ]
+        self.assertEqual(enabled, ["forward"])
+        self.assertIn("NPU MEM", config["profiling"]["exclude_tracks"])
+        self.assertIn("QoS", config["profiling"]["exclude_tracks"])
+
 
 class ExperimentSchemaTests(unittest.TestCase):
+
+    def test_profile_scopes_are_independently_configurable(self) -> None:
+        spec = default_spec()
+        spec["profiling"]["scopes"] = {
+            name: name in {"prefill", "decode"}
+            for name in PROFILE_SCOPE_NAMES
+        }
+
+        validate_spec(spec)
+
+        self.assertEqual(enabled_profile_scopes(spec), ("prefill", "decode"))
+
+    def test_profile_scopes_reject_unknown_names_and_non_booleans(self) -> None:
+        spec = default_spec()
+        spec["profiling"]["scopes"]["typo"] = True
+        with self.assertRaisesRegex(ValueError, "unsupported names: typo"):
+            validate_spec(spec)
+
+        spec = default_spec()
+        spec["profiling"]["scopes"]["forward"] = "yes"
+        with self.assertRaisesRegex(ValueError, "forward.*true or false"):
+            validate_spec(spec)
+
+    def test_profile_trace_mode_rejects_unknown_values(self) -> None:
+        spec = default_spec()
+        spec["profiling"]["trace_mode"] = "operators_off"
+
+        with self.assertRaisesRegex(ValueError, "profiling.trace_mode"):
+            validate_spec(spec)
+
+    def test_profile_excluded_tracks_require_non_empty_names(self) -> None:
+        spec = default_spec()
+        spec["profiling"]["exclude_tracks"] = ["HBM", ""]
+
+        with self.assertRaisesRegex(ValueError, "exclude_tracks"):
+            validate_spec(spec)
 
     def test_custom_matrix_requires_explicit_cases(self) -> None:
         spec = default_spec()
@@ -321,6 +553,107 @@ class ResumeStateTests(unittest.TestCase):
             loaded = ExperimentState.load(path)
         self.assertEqual(loaded.run_id, "run-2")
         self.assertEqual(loaded.cases["P1"].attempts, 2)
+
+
+class TraceMergeTests(unittest.TestCase):
+
+    def test_rank_trace_arrays_are_streamed_into_one_valid_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            profile_root = Path(temporary)
+            rank0 = profile_root / "rank0" / "ASCEND_PROFILER_OUTPUT"
+            rank1 = profile_root / "rank1" / "ASCEND_PROFILER_OUTPUT"
+            rank0.mkdir(parents=True)
+            rank1.mkdir(parents=True)
+            (rank0 / "trace_view.json").write_text(
+                '[{"pid": 10, "name": "rank0-event"}]\n',
+                encoding="utf-8",
+            )
+            (rank1 / "trace_view.json").write_text(
+                '[\n  {"pid": 20, "name": "rank1-event"}\n]\n',
+                encoding="utf-8",
+            )
+
+            merged_path = merge_trace_view_files(
+                profile_root, expected_minimum=2, chunk_size=7
+            )
+
+            self.assertEqual(merged_path.name, MERGED_TRACE_NAME)
+            self.assertEqual(
+                json.loads(merged_path.read_text(encoding="utf-8")),
+                [
+                    {"pid": 10, "name": "rank0-event"},
+                    {"pid": 20, "name": "rank1-event"},
+                ],
+            )
+
+    def test_merge_fails_when_a_parallel_rank_trace_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            profile_root = Path(temporary)
+            rank0 = profile_root / "rank0" / "ASCEND_PROFILER_OUTPUT"
+            rank0.mkdir(parents=True)
+            (rank0 / "trace_view.json").write_text("[]", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "expected at least 2"):
+                merge_trace_view_files(profile_root, expected_minimum=2)
+
+    def test_scopes_only_merge_removes_cpu_and_runtime_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            profile_root = Path(temporary)
+            events_by_rank = (
+                [
+                    {
+                        "pid": 10,
+                        "cat": "cpu_op",
+                        "name": "forward",
+                        "args": {"text": "comma, brace } and quote \""},
+                    },
+                    {"pid": 10, "cat": "cpu_op", "name": "aten::slice"},
+                    {"pid": 10, "cat": "enqueue", "name": "Enqueue@Matmul"},
+                    {
+                        "pid": 110,
+                        "ph": "M",
+                        "name": "process_name",
+                        "args": {"name": "HBM"},
+                    },
+                    {"pid": 110, "ph": "C", "name": "HBM 0/Read"},
+                    {"pid": 100, "cat": "", "name": "MatMulV3"},
+                ],
+                [
+                    {"pid": 20, "cat": "cpu_op", "name": "prefill"},
+                    {"pid": 20, "cat": "dequeue", "name": "Dequeue@Matmul"},
+                    {"pid": 200, "cat": "", "name": "HcclSend"},
+                ],
+            )
+            for rank, events in enumerate(events_by_rank):
+                output = (
+                    profile_root
+                    / f"rank{rank}"
+                    / "ASCEND_PROFILER_OUTPUT"
+                )
+                output.mkdir(parents=True)
+                (output / "trace_view.json").write_text(
+                    json.dumps(events), encoding="utf-8"
+                )
+
+            merged_path = merge_trace_view_files(
+                profile_root,
+                expected_minimum=2,
+                chunk_size=5,
+                allowed_cpu_scopes=frozenset({"forward"}),
+                excluded_process_names=frozenset({"HBM"}),
+            )
+            merged = json.loads(merged_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                [event["name"] for event in merged],
+                ["forward", "MatMulV3", "HcclSend"],
+            )
+
+    def test_controller_merges_only_pipeline_parallel_profiles(self) -> None:
+        controller = REMOTE_CONTROLLER.read_text(encoding="utf-8")
+
+        self.assertIn("if case.pp > 1:", controller)
+        self.assertIn("expected_minimum=case.world_size", controller)
 
 
 class TraceAnalysisTests(unittest.TestCase):

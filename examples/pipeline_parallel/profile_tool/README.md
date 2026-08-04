@@ -199,13 +199,48 @@ D:\vllm-parallel-bench\<run_id>\
 │   ├── communication_breakdown.svg
 │   └── scaling_efficiency.svg
 ├── cases\<case_id>\request_metrics.jsonl
-└── profiles\<case_id>\...\ASCEND_PROFILER_OUTPUT\
-    ├── trace_view.json
-    ├── kernel_details.csv
-    └── operator_details.csv
+└── profiles\<case_id>\
+    ├── merged_trace_view.json
+    └── ...\ASCEND_PROFILER_OUTPUT\
+        ├── trace_view.json
+        ├── kernel_details.csv
+        └── operator_details.csv
 ```
 
-Windows 端可直接用 MindStudio Insight 打开各 rank 的 `trace_view.json`。
+当 case 的 `PP > 1` 时，控制器会在远端以流式方式把所有 rank 的
+`trace_view.json` 合并为 `merged_trace_view.json`。原始 rank Profiling 数据继续保留
+在远端；`Fetch` 只下载合并后的 Trace，不下载 `profiles` 下的其他文件。Windows 端
+可直接用 MindStudio Insight 或 Perfetto 打开 `merged_trace_view.json`。
+
+高层模型事件由配置文件中的 `profiling.scopes` 控制。若只想在 Python 轨迹中
+看到 `forward`，使用 `scopes_only`：
+
+```json
+"profiling": {
+  "trace_mode": "scopes_only",
+  "exclude_tracks": [
+    "NPU MEM", "Acc PMU", "HBM", "Stars Soc Info",
+    "LLC", "QoS", "AI Core Freq"
+  ],
+  "scopes": {
+    "forward": true,
+    "prefill": false,
+    "decode": false,
+    "chunked_prefill": false,
+    "spec_decode": false
+  }
+}
+```
+
+`trace_mode` 为 `full` 时保留全部 PyTorch、CANN queue/runtime 细节；设为
+`scopes_only` 时，合并 Trace 会删除这些密集的小事件，只保留已启用的高层 CPU
+scope，同时继续保留 NPU Hardware 事件。`exclude_tracks` 会按 process 名称删除
+整条可选硬件计数器轨迹。
+
+各开关彼此独立。全部设为 `false` 时不会启用 vLLM custom scopes，但普通
+PyTorch、CANN 和 NPU 算子采集仍正常。对应 case 还必须设置 `"profile": true`。
+`Submit` 重建容器后会校验并安装这些高层埋点；修改只作用于本次创建的容器，
+不会覆盖宿主机源码或 Docker 镜像。
 `report.html` 和 SVG 不依赖 Python 绘图库，可直接用浏览器打开。
 
 ## 9. 安全和故障边界

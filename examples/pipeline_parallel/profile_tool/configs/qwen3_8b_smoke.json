@@ -6,6 +6,10 @@
     "ssh_port": 22,
     "ssh_multiplexing": false,
     "ssh_control_persist_seconds": 600,
+    "ssh_connect_timeout_seconds": 15,
+    "ssh_server_alive_interval_seconds": 15,
+    "ssh_server_alive_count_max": 3,
+    "remote_command_timeout_seconds": 600,
     "output_dir": "D:\\vllm-parallel-bench",
     "remote_project": "/home/vllm/l00977701/pipeline_parallel",
     "remote_run_root": "/home/vllm/l00977701/runtime/parallel_bench_runs"
@@ -33,17 +37,40 @@
         "tp": 1,
         "ep": false,
         "cp": 1,
-        "profile": false
+        "profile": true
       }
     ]
   },
   "workload": {
     "input_tokens": [128],
     "output_tokens": [16],
-    "concurrency": [1],
+    "concurrency": [2],
     "warmup_requests": 1,
     "repetitions": 1,
     "requests_per_point": 2
+  },
+  "profiling": {
+    "input_tokens": 128,
+    "output_tokens": 16,
+    "num_requests": 2,
+    "concurrency": 2,
+    "trace_mode": "scopes_only",
+    "exclude_tracks": [
+      "NPU MEM",
+      "Acc PMU",
+      "HBM",
+      "Stars Soc Info",
+      "LLC",
+      "QoS",
+      "AI Core Freq"
+    ],
+    "scopes": {
+      "forward": true,
+      "prefill": false,
+      "decode": false,
+      "chunked_prefill": false,
+      "spec_decode": false
+    }
   },
   "resource": {
     "poll_seconds": 60,
@@ -52,7 +79,7 @@
   },
   "execution": {
     "execution_mode": "aclgraph",
-    "profile_policy": "none",
+    "profile_policy": "representative_and_boundary",
     "allow_service_mutation": true
   }
 }

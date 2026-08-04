@@ -512,6 +512,8 @@ def run_profile(config: ProfileConfig) -> Path:
             "HF_HUB_OFFLINE=1",
             "-e",
             "TRANSFORMERS_OFFLINE=1",
+            "-e",
+            "VLLM_CUSTOM_SCOPES_FOR_PROFILING=1",
             config.container,
             "bash",
             "-lc",

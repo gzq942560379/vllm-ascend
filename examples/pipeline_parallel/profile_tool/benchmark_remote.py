@@ -19,11 +19,12 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from experiment_schema import (
     CapabilitySet,
     ParallelCase,
+    enabled_profile_scopes,
     expand_cases,
     load_spec,
     render_parallel_flags,
@@ -39,8 +40,243 @@ from report_generator import generate_report
 from metrics_analyzer import analyze_bubbles, analyze_kernel_csv
 
 
+MERGED_TRACE_NAME = "merged_trace_view.json"
+JSON_WHITESPACE = b" \t\r\n"
+JSON_WHITESPACE_VALUES = frozenset(JSON_WHITESPACE)
+TRACE_DETAIL_CATEGORIES = frozenset(
+    {"async_npu", "async_task_queue", "dequeue", "enqueue"}
+)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _json_array_body_bounds(path: Path) -> tuple[int, int] | None:
+    """Return byte offsets for a top-level JSON array body without loading it."""
+    with path.open("rb") as source:
+        position = 0
+        while True:
+            value = source.read(1)
+            if not value:
+                raise ValueError(f"empty trace file: {path}")
+            if value not in JSON_WHITESPACE:
+                break
+            position += 1
+        if value != b"[":
+            raise ValueError(f"trace is not a top-level JSON array: {path}")
+        body_start = position + 1
+        source.seek(body_start)
+        while True:
+            value = source.read(1)
+            if not value:
+                raise ValueError(f"unterminated trace array: {path}")
+            if value not in JSON_WHITESPACE:
+                break
+            body_start += 1
+        if value == b"]":
+            return None
+
+        source.seek(0, os.SEEK_END)
+        position = source.tell() - 1
+        while position >= 0:
+            source.seek(position)
+            value = source.read(1)
+            if value not in JSON_WHITESPACE:
+                break
+            position -= 1
+        if position < 0 or value != b"]":
+            raise ValueError(f"unterminated trace array: {path}")
+        body_end = position
+        position -= 1
+        while position >= body_start:
+            source.seek(position)
+            value = source.read(1)
+            if value not in JSON_WHITESPACE:
+                break
+            position -= 1
+        return body_start, position + 1
+
+
+def _iter_json_array_items(
+    path: Path, *, chunk_size: int
+) -> Iterator[bytes]:
+    """Yield top-level JSON array items without loading the whole trace."""
+    item = bytearray()
+    array_started = False
+    item_started = False
+    finished = False
+    depth = 0
+    in_string = False
+    escaped = False
+
+    with path.open("rb") as source:
+        while block := source.read(chunk_size):
+            for value in block:
+                if finished:
+                    if value not in JSON_WHITESPACE_VALUES:
+                        raise ValueError(
+                            f"unexpected content after trace array: {path}"
+                        )
+                    continue
+                if not array_started:
+                    if value in JSON_WHITESPACE_VALUES:
+                        continue
+                    if value != ord("["):
+                        raise ValueError(
+                            f"trace is not a top-level JSON array: {path}"
+                        )
+                    array_started = True
+                    continue
+                if not item_started:
+                    if value in JSON_WHITESPACE_VALUES or value == ord(","):
+                        continue
+                    if value == ord("]"):
+                        finished = True
+                        continue
+                    item_started = True
+
+                if not in_string and depth == 0 and value in (
+                    ord(","),
+                    ord("]"),
+                ):
+                    encoded_item = bytes(item).strip()
+                    if encoded_item:
+                        yield encoded_item
+                    item.clear()
+                    item_started = False
+                    if value == ord("]"):
+                        finished = True
+                    continue
+
+                item.append(value)
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif value == ord("\\"):
+                        escaped = True
+                    elif value == ord('"'):
+                        in_string = False
+                elif value == ord('"'):
+                    in_string = True
+                elif value in (ord("{"), ord("[")):
+                    depth += 1
+                elif value in (ord("}"), ord("]")):
+                    depth -= 1
+                    if depth < 0:
+                        raise ValueError(
+                            f"invalid trace array nesting: {path}"
+                        )
+
+    if not array_started or not finished or in_string or depth:
+        raise ValueError(f"unterminated trace array: {path}")
+
+
+def _keep_trace_item(
+    encoded_item: bytes,
+    allowed_cpu_scopes: frozenset[str] | None,
+    excluded_process_names: frozenset[str] = frozenset(),
+    excluded_pids: set[object] | None = None,
+) -> bool:
+    event = json.loads(encoded_item)
+    if not isinstance(event, Mapping):
+        return True
+    event_pid = event.get("pid")
+    event_args = event.get("args", {})
+    process_name = (
+        str(event_args.get("name", ""))
+        if isinstance(event_args, Mapping)
+        else ""
+    )
+    if (
+        event.get("ph") == "M"
+        and event.get("name") == "process_name"
+        and process_name in excluded_process_names
+    ):
+        if excluded_pids is not None:
+            excluded_pids.add(event_pid)
+        return False
+    if excluded_pids is not None and event_pid in excluded_pids:
+        return False
+    category = str(event.get("cat", ""))
+    if allowed_cpu_scopes is not None and category == "cpu_op":
+        return str(event.get("name", "")) in allowed_cpu_scopes
+    return (
+        allowed_cpu_scopes is None
+        or category not in TRACE_DETAIL_CATEGORIES
+    )
+
+
+def merge_trace_view_files(
+    profile_root: Path,
+    *,
+    expected_minimum: int = 2,
+    chunk_size: int = 1024 * 1024,
+    allowed_cpu_scopes: frozenset[str] | None = None,
+    excluded_process_names: frozenset[str] = frozenset(),
+) -> Path:
+    """Stream rank trace arrays into one JSON array with bounded memory use."""
+    output_path = profile_root / MERGED_TRACE_NAME
+    trace_paths = sorted(
+        path
+        for path in profile_root.glob("**/trace_view.json")
+        if path.resolve() != output_path.resolve()
+    )
+    if len(trace_paths) < expected_minimum:
+        raise RuntimeError(
+            f"expected at least {expected_minimum} rank traces under "
+            f"{profile_root}, found {len(trace_paths)}"
+        )
+    temporary_path = output_path.with_suffix(".json.tmp")
+    try:
+        with temporary_path.open("wb") as destination:
+            destination.write(b"[")
+            wrote_body = False
+            for trace_path in trace_paths:
+                if (
+                    allowed_cpu_scopes is not None
+                    or excluded_process_names
+                ):
+                    excluded_pids: set[object] = set()
+                    for encoded_item in _iter_json_array_items(
+                        trace_path, chunk_size=chunk_size
+                    ):
+                        if not _keep_trace_item(
+                            encoded_item,
+                            allowed_cpu_scopes,
+                            excluded_process_names,
+                            excluded_pids,
+                        ):
+                            continue
+                        if wrote_body:
+                            destination.write(b",\n")
+                        destination.write(encoded_item)
+                        wrote_body = True
+                    continue
+                bounds = _json_array_body_bounds(trace_path)
+                if bounds is None:
+                    continue
+                if wrote_body:
+                    destination.write(b",\n")
+                start, end = bounds
+                remaining = end - start
+                with trace_path.open("rb") as source:
+                    source.seek(start)
+                    while remaining:
+                        block = source.read(min(chunk_size, remaining))
+                        if not block:
+                            raise RuntimeError(
+                                f"trace ended unexpectedly: {trace_path}"
+                            )
+                        destination.write(block)
+                        remaining -= len(block)
+                wrote_body = True
+            destination.write(b"]\n")
+        temporary_path.replace(output_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return output_path
 
 
 class CaseStatus(str, Enum):
@@ -557,22 +793,31 @@ class RemoteController:
             f"echo $$ > {shlex.quote(pid_file)}; "
             f"exec {shlex.join(command)} > {shlex.quote(service_log)} 2>&1"
         )
+        docker_command = [
+            "docker",
+            "exec",
+            "-d",
+            "-e",
+            f"ASCEND_RT_VISIBLE_DEVICES={','.join(map(str, devices))}",
+            "-e",
+            "HF_HUB_OFFLINE=1",
+            "-e",
+            "TRANSFORMERS_OFFLINE=1",
+        ]
+        profile_scopes = enabled_profile_scopes(self.spec)
+        if case.profile and profile_scopes:
+            docker_command.extend(
+                [
+                    "-e",
+                    "VLLM_CUSTOM_SCOPES_FOR_PROFILING=1",
+                    "-e",
+                    "VLLM_ASCEND_PROFILING_SCOPES="
+                    + ",".join(profile_scopes),
+                ]
+            )
+        docker_command.extend([container, "bash", "-lc", shell_command])
         launch = subprocess.run(
-            [
-                "docker",
-                "exec",
-                "-d",
-                "-e",
-                f"ASCEND_RT_VISIBLE_DEVICES={','.join(map(str, devices))}",
-                "-e",
-                "HF_HUB_OFFLINE=1",
-                "-e",
-                "TRANSFORMERS_OFFLINE=1",
-                container,
-                "bash",
-                "-lc",
-                shell_command,
-            ],
+            docker_command,
             capture_output=True,
             text=True,
         )
@@ -775,6 +1020,20 @@ class RemoteController:
             raise RuntimeError(
                 "profiler analysis failed: "
                 + (completed.stderr or completed.stdout)[-2000:]
+            )
+        if case.pp > 1:
+            allowed_cpu_scopes = None
+            if self.spec["profiling"]["trace_mode"] == "scopes_only":
+                allowed_cpu_scopes = frozenset(
+                    enabled_profile_scopes(self.spec)
+                )
+            merge_trace_view_files(
+                self.run_dir / "profiles" / case.case_id,
+                expected_minimum=case.world_size,
+                allowed_cpu_scopes=allowed_cpu_scopes,
+                excluded_process_names=frozenset(
+                    self.spec["profiling"]["exclude_tracks"]
+                ),
             )
         self._analyze_profile_metrics(case)
 

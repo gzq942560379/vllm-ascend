@@ -13,6 +13,14 @@ from typing import Any, Mapping
 
 DEFAULT_MODEL_PATH = "/home/vllm/l00977701/models/Qwen3-30B-A3B"
 MAX_ASCEND_DIES = 16
+PROFILE_SCOPE_NAMES = (
+    "forward",
+    "prefill",
+    "decode",
+    "chunked_prefill",
+    "spec_decode",
+)
+TRACE_MODES = ("full", "scopes_only")
 
 
 @dataclass(frozen=True)
@@ -124,6 +132,9 @@ def default_spec() -> dict[str, Any]:
             "output_tokens": 64,
             "num_requests": 16,
             "concurrency": 4,
+            "trace_mode": "full",
+            "exclude_tracks": [],
+            "scopes": {name: True for name in PROFILE_SCOPE_NAMES},
         },
         "resource": {
             "max_dies": MAX_ASCEND_DIES,
@@ -181,6 +192,38 @@ def validate_spec(spec: Mapping[str, Any]) -> None:
         values = spec["workload"][field]
         if not values or any(int(value) < 1 for value in values):
             raise ValueError(f"workload.{field} must contain positive integers")
+    profile_scopes = spec["profiling"]["scopes"]
+    if not isinstance(profile_scopes, Mapping):
+        raise ValueError("profiling.scopes must be an object")
+    unknown_scopes = sorted(set(profile_scopes) - set(PROFILE_SCOPE_NAMES))
+    if unknown_scopes:
+        raise ValueError(
+            "profiling.scopes contains unsupported names: "
+            + ", ".join(unknown_scopes)
+        )
+    for name in PROFILE_SCOPE_NAMES:
+        if not isinstance(profile_scopes.get(name), bool):
+            raise ValueError(f"profiling.scopes.{name} must be true or false")
+    trace_mode = str(spec["profiling"]["trace_mode"])
+    if trace_mode not in TRACE_MODES:
+        raise ValueError(
+            f"profiling.trace_mode must be one of {TRACE_MODES}, "
+            f"got {trace_mode!r}"
+        )
+    exclude_tracks = spec["profiling"]["exclude_tracks"]
+    if not isinstance(exclude_tracks, list) or any(
+        not isinstance(name, str) or not name.strip()
+        for name in exclude_tracks
+    ):
+        raise ValueError(
+            "profiling.exclude_tracks must be a list of non-empty strings"
+        )
+
+
+def enabled_profile_scopes(spec: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return enabled high-level trace scopes in deterministic order."""
+    scopes = spec["profiling"]["scopes"]
+    return tuple(name for name in PROFILE_SCOPE_NAMES if scopes[name])
 
 
 def expand_quick_matrix(spec: Mapping[str, Any]) -> list[ParallelCase]:

@@ -44,6 +44,14 @@ param(
     [int]$ProfileOutputTokens = 64,
     [ValidateRange(1, 21600)]
     [int]$MaxWaitSeconds = 21600,
+    [ValidateRange(1, 300)]
+    [int]$SshConnectTimeoutSeconds = 15,
+    [ValidateRange(5, 300)]
+    [int]$SshServerAliveIntervalSeconds = 15,
+    [ValidateRange(1, 10)]
+    [int]$SshServerAliveCountMax = 3,
+    [ValidateRange(30, 3600)]
+    [int]$RemoteCommandTimeoutSeconds = 600,
     [switch]$DryRun
 )
 
@@ -59,7 +67,8 @@ $requiredFiles = @(
     "workload_streaming.py",
     "profiler_collect.py",
     "metrics_analyzer.py",
-    "report_generator.py"
+    "report_generator.py",
+    "install_profile_scopes.py"
 )
 
 function Test-ExplicitParameter {
@@ -113,6 +122,30 @@ if ($null -ne $client) {
     if (-not (Test-ExplicitParameter "RemoteRunRoot")) {
         $RemoteRunRoot = [string](
             Get-OptionalProperty $client "remote_run_root" $RemoteRunRoot
+        )
+    }
+    if (-not (Test-ExplicitParameter "SshConnectTimeoutSeconds")) {
+        $SshConnectTimeoutSeconds = [int](
+            Get-OptionalProperty $client "ssh_connect_timeout_seconds" `
+                $SshConnectTimeoutSeconds
+        )
+    }
+    if (-not (Test-ExplicitParameter "SshServerAliveIntervalSeconds")) {
+        $SshServerAliveIntervalSeconds = [int](
+            Get-OptionalProperty $client "ssh_server_alive_interval_seconds" `
+                $SshServerAliveIntervalSeconds
+        )
+    }
+    if (-not (Test-ExplicitParameter "SshServerAliveCountMax")) {
+        $SshServerAliveCountMax = [int](
+            Get-OptionalProperty $client "ssh_server_alive_count_max" `
+                $SshServerAliveCountMax
+        )
+    }
+    if (-not (Test-ExplicitParameter "RemoteCommandTimeoutSeconds")) {
+        $RemoteCommandTimeoutSeconds = [int](
+            Get-OptionalProperty $client "remote_command_timeout_seconds" `
+                $RemoteCommandTimeoutSeconds
         )
     }
 }
@@ -261,6 +294,13 @@ if ($persistSeconds -lt 30 -or $persistSeconds -gt 86400) {
     throw "client.ssh_control_persist_seconds must be between 30 and 86400."
 }
 $multiplexing = [bool](Get-OptionalProperty $client "ssh_multiplexing" $true)
+if ($multiplexing -and $env:OS -eq "Windows_NT") {
+    Write-Warning (
+        "SSH multiplexing is not supported by Win32 OpenSSH; " +
+        "using the batched Windows submit workflow instead."
+    )
+    $multiplexing = $false
+}
 
 $spec = $config | ConvertTo-Json -Depth 20 | ConvertFrom-Json
 $spec.PSObject.Properties.Remove("client")
@@ -320,14 +360,27 @@ if ($DryRun) {
     return
 }
 
-foreach ($program in @("ssh", "scp")) {
+$requiredPrograms = @("ssh")
+if ($Action -in @("Submit", "Fetch")) {
+    $requiredPrograms += "scp"
+}
+if ($Action -in @("Submit", "Fetch")) {
+    $requiredPrograms += "tar"
+}
+foreach ($program in $requiredPrograms) {
     if (-not (Get-Command $program -ErrorAction SilentlyContinue)) {
         throw "$program was not found. Install Windows OpenSSH Client."
     }
 }
 
-$sshArgs = @("-p", "$SshPort")
-$scpArgs = @("-P", "$SshPort")
+$connectionOptions = @(
+    "-o", "ConnectTimeout=$SshConnectTimeoutSeconds",
+    "-o", "ConnectionAttempts=1",
+    "-o", "ServerAliveInterval=$SshServerAliveIntervalSeconds",
+    "-o", "ServerAliveCountMax=$SshServerAliveCountMax"
+)
+$sshArgs = @("-p", "$SshPort") + $connectionOptions
+$scpArgs = @("-P", "$SshPort") + $connectionOptions
 if ($multiplexing) {
     $identity = [Text.Encoding]::UTF8.GetBytes("$target-$SshPort-$PID")
     $hasher = [Security.Cryptography.SHA256]::Create()
@@ -370,21 +423,37 @@ function Close-SshMaster {
 }
 
 function Invoke-Ssh {
-    param([Parameter(Mandatory = $true)][string]$Command)
+    param(
+        [Parameter(Mandatory = $true)][string]$Command,
+        [string]$Operation = "remote command",
+        [int]$TimeoutSeconds = $RemoteCommandTimeoutSeconds
+    )
     $commandBytes = [Text.Encoding]::UTF8.GetBytes($Command)
     $encodedCommand = [Convert]::ToBase64String($commandBytes)
-    $remoteCommand = "printf %s $encodedCommand | base64 -d | bash"
+    $remoteCommand = (
+        "printf %s $encodedCommand | base64 -d | " +
+        "timeout --foreground ${TimeoutSeconds}s bash"
+    )
+    Write-Host "  -> $Operation (timeout: ${TimeoutSeconds}s)"
     & ssh @sshArgs $target $remoteCommand
-    if ($LASTEXITCODE -ne 0) {
-        throw "Remote command failed with exit code $LASTEXITCODE."
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 124) {
+        throw "$Operation timed out after $TimeoutSeconds seconds."
+    }
+    if ($exitCode -ne 0) {
+        throw "$Operation failed with exit code $exitCode."
     }
 }
 
 function Invoke-Scp {
-    param([Parameter(Mandatory = $true)][object[]]$Arguments)
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Arguments,
+        [string]$Operation = "file upload"
+    )
+    Write-Host "  -> $Operation"
     & scp @scpArgs @Arguments
     if ($LASTEXITCODE -ne 0) {
-        throw "SCP failed with exit code $LASTEXITCODE."
+        throw "$Operation failed with exit code $LASTEXITCODE."
     }
 }
 
@@ -412,18 +481,52 @@ try {
                 "case `"`$pid`" in (*[!0-9]*|`"`") echo 'CONTROLLER_ALIVE=false';; " +
                 "(*) if kill -0 `"`$pid`" 2>/dev/null; then echo 'CONTROLLER_ALIVE=true'; " +
                 "else echo 'CONTROLLER_ALIVE=false'; fi;; esac"
-            Invoke-Ssh $statusCommand
+            Invoke-Ssh $statusCommand -Operation "reading remote status"
             return
         }
         "Fetch" {
             New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
-            Invoke-Scp -Arguments @("-r", "${target}:$remoteRun", $OutputDir)
+            $remoteFetchArchive = "/tmp/$RunId-fetch.tar.gz"
+            $remoteFetchList = "/tmp/$RunId-fetch-files"
+            $localFetchArchive = Join-Path (
+                [IO.Path]::GetTempPath()
+            ) "$RunId-fetch.tar.gz"
+            $fetchCommand = "set -e; cd '$RemoteRunRoot'; " +
+                "test -d '$RunId'; rm -f '$remoteFetchArchive' '$remoteFetchList'; " +
+                "find '$RunId' -path '$RunId/profiles' -prune -o -type f -print0 " +
+                "> '$remoteFetchList'; " +
+                "if test -d '$RunId/profiles'; then " +
+                "find '$RunId/profiles' -type f -name 'merged_trace_view.json' " +
+                "-print0 >> '$remoteFetchList'; fi; " +
+                "tar --null --files-from='$remoteFetchList' " +
+                "-czf '$remoteFetchArchive'; rm -f '$remoteFetchList'; " +
+                "nohup sh -c 'sleep 3600; rm -f $remoteFetchArchive' " +
+                ">/dev/null 2>&1 &"
+            try {
+                Write-Host "[1/3] Packaging filtered results on the remote host ..."
+                Invoke-Ssh $fetchCommand -Operation "packaging filtered run results"
+                Write-Host "[2/3] Downloading one result archive ..."
+                Invoke-Scp -Arguments @(
+                    "${target}:$remoteFetchArchive",
+                    $localFetchArchive
+                ) -Operation "downloading filtered run results"
+                Write-Host "[3/3] Extracting results locally ..."
+                & tar -xzf $localFetchArchive -C $OutputDir
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Failed to extract the downloaded result archive."
+                }
+            } finally {
+                Remove-Item -LiteralPath $localFetchArchive -Force `
+                    -ErrorAction SilentlyContinue
+            }
             Write-Host "Downloaded: $(Join-Path $OutputDir $RunId)"
+            Write-Host "Profiles: merged_trace_view.json only"
             Write-Host "Report: $(Join-Path (Join-Path $OutputDir $RunId) 'report.html')"
             return
         }
         "Cancel" {
-            Invoke-Ssh "touch '$remoteRun/CANCEL'"
+            Invoke-Ssh "touch '$remoteRun/CANCEL'" `
+                -Operation "requesting cancellation"
             Write-Host "Cancellation requested."
             return
         }
@@ -432,7 +535,7 @@ try {
                 "rm -f '$remoteRun/CANCEL' && " +
                 "nohup python3 '$remoteController' --run-dir '$remoteRun' --spec '$remoteSpec' " +
                 ">> '$remoteRun/controller.log' 2>&1 < /dev/null & echo `$! > '$remoteRun/controller.pid'"
-            Invoke-Ssh $launch
+            Invoke-Ssh $launch -Operation "resuming detached controller"
             Write-Host "Resumed detached run: $RunId"
             return
         }
@@ -454,6 +557,8 @@ try {
     $temporarySpec = Join-Path ([IO.Path]::GetTempPath()) "$RunId-spec.json"
     $temporaryDocker = Join-Path ([IO.Path]::GetTempPath()) "$RunId-docker.sh"
     $temporarySelector = Join-Path ([IO.Path]::GetTempPath()) "$RunId-find-idle.sh"
+    $temporaryBundle = Join-Path ([IO.Path]::GetTempPath()) "$RunId-submit"
+    $temporaryArchive = Join-Path ([IO.Path]::GetTempPath()) "$RunId-submit.tar"
     try {
         Write-LfCopy -Source $dockerScript -Destination $temporaryDocker
         Write-LfCopy -Source $selectorScript -Destination $temporarySelector
@@ -462,27 +567,56 @@ try {
             ($spec | ConvertTo-Json -Depth 20),
             [Text.UTF8Encoding]::new($false)
         )
-        Write-Host "[1/3] Preparing the remote run and uploading tools ..."
-        Invoke-Ssh "mkdir -p '$remoteTool' '$remoteRun'"
-        $upload = @($requiredFiles | ForEach-Object { Join-Path $toolDir $_ })
-        Invoke-Scp -Arguments @($upload + "${target}:$remoteTool/")
-        Invoke-Scp -Arguments @(
-            $temporarySelector,
-            "${target}:$RemoteProject/find_idle_npu.sh"
+        New-Item -ItemType Directory -Force -Path (
+            Join-Path $temporaryBundle "profile_tool"
+        ) | Out-Null
+        foreach ($file in $requiredFiles) {
+            Copy-Item -LiteralPath (Join-Path $toolDir $file) -Destination (
+                Join-Path (Join-Path $temporaryBundle "profile_tool") $file
+            )
+        }
+        Copy-Item -LiteralPath $temporarySelector -Destination (
+            Join-Path $temporaryBundle "find_idle_npu.sh"
         )
-        Invoke-Scp -Arguments @($temporaryDocker, "${target}:$remoteDocker")
-        Invoke-Ssh "chmod +x '$RemoteProject/find_idle_npu.sh' '$remoteDocker'"
-        Invoke-Scp -Arguments @($temporarySpec, "${target}:$remoteSpec")
+        Copy-Item -LiteralPath $temporaryDocker -Destination (
+            Join-Path $temporaryBundle "docker.sh"
+        )
+        Copy-Item -LiteralPath $temporarySpec -Destination (
+            Join-Path $temporaryBundle "spec.json"
+        )
+        & tar -cf $temporaryArchive -C $temporaryBundle .
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create the submit bundle."
+        }
 
-        Write-Host "[2/3] Recreating the test container with the configured model ..."
-        $containerCommand = "CONTAINER_NAME='$Container' MODEL_DIR='$Model' '$remoteDocker' restart"
-        Invoke-Ssh $containerCommand
+        $remoteArchive = "/tmp/$RunId-submit.tar"
+        $remoteUpload = "$remoteRun/.submit-upload"
+        Write-Host "[1/3] Uploading one bundled payload (password prompt 1/2) ..."
+        Invoke-Scp -Arguments @($temporaryArchive, "${target}:$remoteArchive") `
+            -Operation "uploading bundled benchmark payload"
 
-        Write-Host "[3/3] Launching the controller with nohup ..."
-        $launch = "cd '$remoteTool' && " +
+        Write-Host "[2/3] Preparing container and controller (password prompt 2/2) ..."
+        $submitCommand = "set -e; " +
+            "echo '[remote 1/3] Installing uploaded tools'; " +
+            "rm -rf '$remoteUpload'; mkdir -p '$remoteUpload' '$remoteTool' '$remoteRun'; " +
+            "tar -xf '$remoteArchive' -C '$remoteUpload'; rm -f '$remoteArchive'; " +
+            "cp -f '$remoteUpload/profile_tool/'*.py '$remoteTool/'; " +
+            "cp -f '$remoteUpload/find_idle_npu.sh' '$RemoteProject/find_idle_npu.sh'; " +
+            "cp -f '$remoteUpload/docker.sh' '$remoteDocker'; " +
+            "cp -f '$remoteUpload/spec.json' '$remoteSpec'; rm -rf '$remoteUpload'; " +
+            "chmod +x '$RemoteProject/find_idle_npu.sh' '$remoteDocker'; " +
+            "echo '[remote 2/3] Recreating the test container'; " +
+            "CONTAINER_NAME='$Container' MODEL_DIR='$Model' '$remoteDocker' restart; " +
+            "echo '[remote 2/3] Installing high-level profiling scopes'; " +
+            "docker exec '$Container' python3 " +
+            "'/workspace/pipeline_parallel/profile_tool/install_profile_scopes.py'; " +
+            "echo '[remote 3/3] Launching the detached controller'; " +
+            "cd '$remoteTool'; " +
             "nohup python3 '$remoteController' --run-dir '$remoteRun' --spec '$remoteSpec' " +
-            "> '$remoteRun/controller.log' 2>&1 < /dev/null & echo `$! > '$remoteRun/controller.pid'"
-        Invoke-Ssh $launch
+            "> '$remoteRun/controller.log' 2>&1 < /dev/null & " +
+            "controller_pid=`$!; echo `"`$controller_pid`" > '$remoteRun/controller.pid'"
+        Invoke-Ssh $submitCommand -Operation "running remote submit workflow"
+        Write-Host "[3/3] Submission complete."
 
         $lastRun = [ordered]@{
             run_id = $RunId
@@ -503,8 +637,11 @@ try {
         Remove-Item -LiteralPath @(
             $temporarySpec,
             $temporaryDocker,
-            $temporarySelector
+            $temporarySelector,
+            $temporaryArchive
         ) -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $temporaryBundle -Recurse -Force `
+            -ErrorAction SilentlyContinue
     }
 } finally {
     Close-SshMaster

@@ -102,6 +102,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -204,6 +205,11 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+ENABLED_FORWARD_PROFILE_SCOPES = frozenset(
+    scope.strip()
+    for scope in envs_ascend.VLLM_ASCEND_PROFILING_SCOPES.split(",")
+    if scope.strip()
+)
 
 
 @dataclass
@@ -244,6 +250,28 @@ def graph_capture(device: torch.device):
 
 def get_tp_context(drafter):
     return getattr(drafter, "tp_group_context", nullcontext())
+
+
+def _forward_profile_scope(attn_state: AscendAttentionState | None) -> str:
+    """Return the high-level semantic scope for one model forward pass."""
+    if attn_state == AscendAttentionState.DecodeOnly:
+        return "decode"
+    if attn_state == AscendAttentionState.SpecDecoding:
+        return "spec_decode"
+    if attn_state == AscendAttentionState.ChunkedPrefill:
+        return "chunked_prefill"
+    if attn_state in (
+        AscendAttentionState.PrefillNoCache,
+        AscendAttentionState.PrefillCacheHit,
+    ):
+        return "prefill"
+    return "unknown_forward_stage"
+
+
+def _forward_profile_context(scope: str):
+    if scope not in ENABLED_FORWARD_PROFILE_SCOPES:
+        return nullcontext()
+    return record_function_or_nullcontext(scope)
 
 
 class ExecuteModelState(NamedTuple):
@@ -2239,7 +2267,8 @@ class NPUModelRunner(GPUModelRunner):
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
         with (
-            record_function_or_nullcontext("forward"),
+            _forward_profile_context("forward"),
+            _forward_profile_context(_forward_profile_scope(self.attn_state)),
             set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
