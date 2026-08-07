@@ -31,21 +31,32 @@ MODEL_RUNNER = (
     / "worker"
     / "model_runner_v1.py"
 )
+WORKER = (
+    Path(__file__).resolve().parents[3]
+    / "vllm_ascend"
+    / "worker"
+    / "worker.py"
+)
 DEFAULT_CLIENT_CONFIG = TOOL_DIR / "configs" / "parallel_bench_config.json"
-SMOKE_CONFIG = TOOL_DIR / "configs" / "qwen3_30b_a3b_smoke.json"
+SMOKE_CONFIG = TOOL_DIR / "configs" / "qwen3_30b_a3b.json"
 QWEN3_8B_SMOKE_CONFIG = TOOL_DIR / "configs" / "qwen3_8b_smoke.json"
+QWEN3_MOE_OFFLOAD_CONFIG = (
+    TOOL_DIR / "configs" / "qwen3_30b_a3b_offload.json"
+)
 sys.path.insert(0, str(TOOL_DIR))
 
 from benchmark_remote import (  # noqa: E402
     CaseStatus,
     ExperimentState,
     MERGED_TRACE_NAME,
+    RemoteController,
     merge_trace_view_files,
     runnable_case_ids,
 )
 from install_profile_scopes import (  # noqa: E402
     patch_envs_source,
     patch_runner_source,
+    patch_worker_source,
 )
 from experiment_schema import (  # noqa: E402
     DEFAULT_MODEL_PATH,
@@ -56,6 +67,8 @@ from experiment_schema import (  # noqa: E402
     expand_boundary_matrix,
     expand_cases,
     expand_quick_matrix,
+    load_spec,
+    render_offload_flags,
     render_parallel_flags,
     validate_spec,
 )
@@ -119,6 +132,7 @@ class WindowsLauncherContractTests(unittest.TestCase):
         self.assertIn("uploading bundled benchmark payload", launcher)
         self.assertIn("password prompt 1/2", launcher)
         self.assertIn("password prompt 2/2", launcher)
+        self.assertIn('$scpArgs = @("-O", "-P", "$SshPort")', launcher)
         self.assertFalse(smoke_config["client"]["ssh_multiplexing"])
         self.assertEqual(
             smoke_config["client"]["ssh_connect_timeout_seconds"], 15
@@ -170,7 +184,11 @@ class WindowsLauncherContractTests(unittest.TestCase):
         controller = REMOTE_CONTROLLER.read_text(encoding="utf-8")
 
         self.assertIn('MODEL_DIR=\'$Model\'', launcher)
-        self.assertIn("MODEL_DIR='$Model' '$remoteDocker' restart", launcher)
+        self.assertIn(
+            "IMAGE='$Image' CONTAINER_NAME='$Container' MODEL_DIR='$Model'",
+            launcher,
+        )
+        self.assertIn("'$remoteDocker' restart", launcher)
         self.assertIn('-v "${MODEL_DIR}:/models"', docker_script)
         self.assertIn('SERVE_MODEL="${SERVE_MODEL:-/models}"', docker_script)
         self.assertIn("cmd_restart() {\n  validate_model_dir", docker_script)
@@ -300,15 +318,37 @@ def execute(self):
     ):
         pass
 '''
+        worker_source = '''from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
+
+class AsyncIntermediateTensors:
+    pass
+
+class NPUWorker(WorkerBase):
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if self._pp_send_work:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
+
+    def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        return self.model_runner.sample_tokens(grammar_output)
+'''
 
         patched_envs = patch_envs_source(envs_source)
         patched_runner = patch_runner_source(runner_source)
+        patched_worker = patch_worker_source(worker_source)
 
         self.assertIn("VLLM_ASCEND_PROFILING_SCOPES", patched_envs)
-        self.assertIn("from vllm_ascend import envs as envs_ascend", patched_runner)
+        self.assertIn("semantic_profile_context", patched_runner)
         self.assertIn("_forward_profile_scope(self.attn_state)", patched_runner)
+        self.assertIn("ProfiledAsyncIntermediateTensors", patched_worker)
+        self.assertIn('semantic_profile_context("worker_step")', patched_worker)
         compile(patched_envs, "envs.py", "exec")
         compile(patched_runner, "model_runner_v1.py", "exec")
+        compile(patched_worker, "worker.py", "exec")
 
     def test_parallel_launcher_passes_only_configured_scopes(self) -> None:
         source = REMOTE_CONTROLLER.read_text(encoding="utf-8")
@@ -320,9 +360,10 @@ def execute(self):
     def test_model_forward_has_nested_semantic_scopes(self) -> None:
         source = MODEL_RUNNER.read_text(encoding="utf-8")
 
-        self.assertIn('_forward_profile_context("forward")', source)
+        self.assertIn('semantic_profile_context("forward")', source)
         self.assertIn("_forward_profile_scope(self.attn_state)", source)
-        self.assertIn("ENABLED_FORWARD_PROFILE_SCOPES", source)
+        self.assertIn('semantic_profile_context("prepare_input")', source)
+        self.assertIn('semantic_profile_context("post_process")', source)
         for scope in (
             'return "prefill"',
             'return "decode"',
@@ -331,7 +372,7 @@ def execute(self):
         ):
             self.assertIn(scope, source)
 
-    def test_8b_smoke_keeps_only_forward_cpu_scope(self) -> None:
+    def test_8b_smoke_enables_python_semantic_scopes(self) -> None:
         config = json.loads(
             QWEN3_8B_SMOKE_CONFIG.read_text(encoding="utf-8")
         )
@@ -342,12 +383,36 @@ def execute(self):
             for name, value in config["profiling"]["scopes"].items()
             if value
         ]
-        self.assertEqual(enabled, ["forward"])
+        self.assertIn("prefill", enabled)
+        self.assertIn("decode", enabled)
+        self.assertIn("worker_step", enabled)
+        self.assertIn("pp_recv_wait", enabled)
+        self.assertNotIn("forward", enabled)
         self.assertIn("NPU MEM", config["profiling"]["exclude_tracks"])
         self.assertIn("QoS", config["profiling"]["exclude_tracks"])
 
 
 class ExperimentSchemaTests(unittest.TestCase):
+
+    def test_hccl_socket_ports_default_to_dynamic_allocation(self) -> None:
+        spec = default_spec()
+
+        self.assertEqual(
+            spec["execution"]["hccl_npu_socket_port_range"], "auto"
+        )
+        self.assertEqual(
+            spec["execution"]["hccl_host_socket_port_range"], "auto"
+        )
+        source = REMOTE_CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn("HCCL_NPU_SOCKET_PORT_RANGE=", source)
+        self.assertIn("HCCL_HOST_SOCKET_PORT_RANGE=", source)
+
+    def test_hccl_socket_port_range_rejects_shell_syntax(self) -> None:
+        spec = default_spec()
+        spec["execution"]["hccl_npu_socket_port_range"] = "auto; touch /tmp/x"
+
+        with self.assertRaisesRegex(ValueError, "HCCL port list/range"):
+            validate_spec(spec)
 
     def test_profile_scopes_are_independently_configurable(self) -> None:
         spec = default_spec()
@@ -359,6 +424,28 @@ class ExperimentSchemaTests(unittest.TestCase):
         validate_spec(spec)
 
         self.assertEqual(enabled_profile_scopes(spec), ("prefill", "decode"))
+
+    def test_python_profile_scopes_are_available(self) -> None:
+        for scope in (
+            "worker_step",
+            "prepare_input",
+            "sample_step",
+            "pp_send_wait",
+            "pp_recv_wait",
+        ):
+            self.assertIn(scope, PROFILE_SCOPE_NAMES)
+
+    def test_worker_has_pipeline_python_semantic_scopes(self) -> None:
+        source = WORKER.read_text(encoding="utf-8")
+        for scope in (
+            "worker_step",
+            "sample_step",
+            "pp_send_wait",
+            "pp_recv_submit",
+            "pp_recv_wait",
+            "pp_send_submit",
+        ):
+            self.assertIn(f'semantic_profile_context("{scope}")', source)
 
     def test_profile_scopes_reject_unknown_names_and_non_booleans(self) -> None:
         spec = default_spec()
@@ -479,6 +566,101 @@ class ExperimentSchemaTests(unittest.TestCase):
         self.assertIn("--pipeline-parallel-size", decision.flags)
         self.assertIn("--enable-expert-parallel", decision.flags)
         self.assertIn("--context-parallel-size", decision.flags)
+
+    def test_prefetch_offload_flags_are_capability_checked(self) -> None:
+        spec = default_spec()
+        spec["offload"] = {
+            "backend": "prefetch",
+            "group_size": 4,
+            "num_in_group": 1,
+            "prefetch_step": 2,
+            "params": ["w13_weight", "w2_weight"],
+        }
+        unsupported = CapabilitySet.from_help_text(
+            "--enable-expert-parallel"
+        )
+        decision = render_offload_flags(spec, unsupported)
+        self.assertEqual(decision.status, "SKIPPED_UNSUPPORTED")
+
+        supported = CapabilitySet.from_help_text(
+            "--offload-backend --offload-group-size "
+            "--offload-num-in-group --offload-prefetch-step "
+            "--offload-params"
+        )
+        decision = render_offload_flags(spec, supported)
+        self.assertIsNone(decision.status)
+        self.assertEqual(
+            decision.flags,
+            (
+                "--offload-backend",
+                "prefetch",
+                "--offload-group-size",
+                "4",
+                "--offload-num-in-group",
+                "1",
+                "--offload-prefetch-step",
+                "2",
+                "--offload-params",
+                "w13_weight",
+                "w2_weight",
+            ),
+        )
+
+    def test_invalid_prefetch_offload_config_is_rejected(self) -> None:
+        spec = default_spec()
+        spec["offload"]["backend"] = "prefetch"
+        spec["offload"]["group_size"] = 2
+        spec["offload"]["num_in_group"] = 3
+        with self.assertRaisesRegex(ValueError, "num_in_group"):
+            validate_spec(spec)
+
+    def test_moe_offload_smoke_config_is_runnable(self) -> None:
+        spec = load_spec(QWEN3_MOE_OFFLOAD_CONFIG)
+        cases = expand_cases(spec)
+
+        self.assertEqual(spec["model"]["kind"], "moe")
+        self.assertEqual(spec["offload"]["backend"], "prefetch")
+        self.assertEqual(
+            spec["offload"]["params"],
+            ["w13_weight", "w2_weight"],
+        )
+        self.assertEqual(spec["execution"]["kv_cache_memory_bytes"], 0)
+        self.assertEqual(len(cases), 1)
+        self.assertTrue(cases[0].ep)
+
+    def test_offload_startup_evidence_is_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            service_log = Path(temporary) / "service.log"
+            service_log.write_text(
+                "[AscendPrefetchOffloader] Initialized\n"
+                "Total NPU memory saved: 2.0 GB\n",
+                encoding="utf-8",
+            )
+
+            RemoteController._record_offload_evidence(
+                service_log, "prefetch"
+            )
+
+            evidence = json.loads(
+                (service_log.parent / "offload_evidence.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(evidence["verified"])
+            self.assertEqual(evidence["backend"], "prefetch")
+
+    def test_missing_offload_startup_evidence_fails_case(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            service_log = Path(temporary) / "service.log"
+            service_log.write_text(
+                "Application startup complete\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "no weight-offload initialization evidence"
+            ):
+                RemoteController._record_offload_evidence(
+                    service_log, "prefetch"
+                )
 
 
 class StreamingMetricTests(unittest.TestCase):
@@ -603,6 +785,12 @@ class TraceMergeTests(unittest.TestCase):
                 [
                     {
                         "pid": 10,
+                        "ph": "M",
+                        "name": "process_name",
+                        "args": {"name": "Python 10"},
+                    },
+                    {
+                        "pid": 10,
                         "cat": "cpu_op",
                         "name": "forward",
                         "args": {"text": "comma, brace } and quote \""},
@@ -646,7 +834,7 @@ class TraceMergeTests(unittest.TestCase):
 
             self.assertEqual(
                 [event["name"] for event in merged],
-                ["forward", "MatMulV3", "HcclSend"],
+                ["process_name", "forward"],
             )
 
     def test_controller_merges_only_pipeline_parallel_profiles(self) -> None:

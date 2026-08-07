@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "client": {
+    "server": "198.186.6.2",
+    "ssh_user": "root",
+    "ssh_port": 22,
+    "ssh_multiplexing": true,
+    "ssh_control_persist_seconds": 600,
+    "ssh_connect_timeout_seconds": 30,
+    "ssh_server_alive_interval_seconds": 15,
+    "ssh_server_alive_count_max": 3,
+    "remote_command_timeout_seconds": 1200,
+    "output_dir": "D:\\vllm-parallel-bench",
+    "remote_project": "/home/l00977701/pipeline_parallel",
+    "remote_run_root": "/home/l00977701/runtime/parallel_bench_runs"
+  },
+  "run": {
+    "run_id": "auto"
+  },
+  "container": {
+    "name": "qwen3_parallel_nightly",
+    "image": "quay.io/ascend/vllm-ascend:nightly-releases-v0.23.0-a3",
+    "expected_vllm_version": "",
+    "expected_vllm_ascend_version": ""
+  },
+  "model": {
+    "name": "Qwen3-30B-A3B",
+    "path": "/home/l00977701/models/Qwen3-30B-A3B",
+    "container_path": "/models",
+    "kind": "moe",
+    "served_name": "qwen3-30b-a3b-offload",
+    "max_model_len": 4096
+  },
+  "matrix": {
+    "preset": "custom",
+    "cases": [
+      {
+        "case_id": "Qwen3-30B-A3B",
+        "pp": 2,
+        "tp": 1,
+        "ep": false,
+        "cp": 1,
+        "profile": false
+      }
+    ]
+  },
+  "workload": {
+    "input_tokens": [7168, 4096, 1024],
+    "output_tokens": [1024, 4096, 7168],
+    "concurrency": [2, 4],
+    "warmup_requests": 4,
+    "repetitions": 1,
+    "requests_per_point": 12
+  },
+  "offload": {
+    "backend": "none",
+    "group_size": 0,
+    "num_in_group": 1,
+    "prefetch_step": 1,
+    "params": []
+  },
+  "resource": {
+    "poll_seconds": 60,
+    "max_wait_seconds": 21600,
+    "max_dies": 16
+  },
+  "execution": {
+    "execution_mode": "eager",
+    "hccl_npu_socket_port_range": "auto",
+    "hccl_host_socket_port_range": "auto",
+    "gpu_memory_utilization": 0.8,
+    "kv_cache_memory_bytes": 0,
+    "profile_policy": "none",
+    "allow_service_mutation": true
+  }
+}

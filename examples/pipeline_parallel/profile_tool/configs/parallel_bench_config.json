@@ -43,15 +43,33 @@
     "output_tokens": 64,
     "num_requests": 16,
     "concurrency": 4,
-    "trace_mode": "full",
+    "trace_mode": "scopes_only",
     "exclude_tracks": [],
     "scopes": {
       "forward": true,
       "prefill": true,
       "decode": true,
       "chunked_prefill": true,
-      "spec_decode": true
+      "spec_decode": true,
+      "worker_step": true,
+      "prepare_input": true,
+      "post_process": true,
+      "sample_step": true,
+      "sample_token": true,
+      "draft_token": true,
+      "async_state_update": true,
+      "pp_send_wait": true,
+      "pp_recv_submit": true,
+      "pp_recv_wait": true,
+      "pp_send_submit": true
     }
+  },
+  "offload": {
+    "backend": "none",
+    "group_size": 0,
+    "num_in_group": 1,
+    "prefetch_step": 1,
+    "params": []
   },
   "resource": {
     "poll_seconds": 60,
@@ -60,6 +78,8 @@
   },
   "execution": {
     "execution_mode": "aclgraph",
+    "gpu_memory_utilization": 0.8,
+    "kv_cache_memory_bytes": 0,
     "profile_policy": "representative_and_boundary",
     "allow_service_mutation": true
   }

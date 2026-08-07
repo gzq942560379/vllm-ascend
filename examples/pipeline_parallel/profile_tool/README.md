@@ -76,7 +76,7 @@ cd E:\vllm\vllm-ascend\examples\pipeline_parallel\profile_tool
 
 ```powershell
 .\parallel_bench.ps1 -Action Submit `
-  -ConfigFile .\configs\qwen3_30b_a3b_smoke.json
+  -ConfigFile .\configs\qwen3_30b_a3b.json
 ```
 
 该烟测只跑 `PP=2, TP=1`、2 个短请求，不启用 Profiling。确认完整生命周期

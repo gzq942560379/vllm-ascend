@@ -27,6 +27,7 @@ from experiment_schema import (
     enabled_profile_scopes,
     expand_cases,
     load_spec,
+    render_offload_flags,
     render_parallel_flags,
 )
 from resource_scheduler import discover_idle_devices, wait_for_lease
@@ -177,6 +178,7 @@ def _keep_trace_item(
     allowed_cpu_scopes: frozenset[str] | None,
     excluded_process_names: frozenset[str] = frozenset(),
     excluded_pids: set[object] | None = None,
+    allowed_pids: frozenset[object] | None = None,
 ) -> bool:
     event = json.loads(encoded_item)
     if not isinstance(event, Mapping):
@@ -199,12 +201,38 @@ def _keep_trace_item(
     if excluded_pids is not None and event_pid in excluded_pids:
         return False
     category = str(event.get("cat", ""))
-    if allowed_cpu_scopes is not None and category == "cpu_op":
-        return str(event.get("name", "")) in allowed_cpu_scopes
+    if allowed_cpu_scopes is not None:
+        if category == "cpu_op":
+            return str(event.get("name", "")) in allowed_cpu_scopes
+        return event.get("ph") == "M" and (
+            allowed_pids is None or event_pid in allowed_pids
+        )
     return (
         allowed_cpu_scopes is None
         or category not in TRACE_DETAIL_CATEGORIES
     )
+
+
+def _find_cpu_scope_pids(
+    trace_path: Path,
+    *,
+    chunk_size: int,
+    allowed_cpu_scopes: frozenset[str],
+) -> frozenset[object]:
+    """Find processes that emitted an enabled Python semantic scope."""
+    process_ids: set[object] = set()
+    for encoded_item in _iter_json_array_items(
+        trace_path, chunk_size=chunk_size
+    ):
+        event = json.loads(encoded_item)
+        if not isinstance(event, Mapping):
+            continue
+        if (
+            str(event.get("cat", "")) == "cpu_op"
+            and str(event.get("name", "")) in allowed_cpu_scopes
+        ):
+            process_ids.add(event.get("pid"))
+    return frozenset(process_ids)
 
 
 def merge_trace_view_files(
@@ -238,6 +266,15 @@ def merge_trace_view_files(
                     or excluded_process_names
                 ):
                     excluded_pids: set[object] = set()
+                    allowed_pids = (
+                        _find_cpu_scope_pids(
+                            trace_path,
+                            chunk_size=chunk_size,
+                            allowed_cpu_scopes=allowed_cpu_scopes,
+                        )
+                        if allowed_cpu_scopes is not None
+                        else None
+                    )
                     for encoded_item in _iter_json_array_items(
                         trace_path, chunk_size=chunk_size
                     ):
@@ -246,6 +283,7 @@ def merge_trace_view_files(
                             allowed_cpu_scopes,
                             excluded_process_names,
                             excluded_pids,
+                            allowed_pids,
                         ):
                             continue
                         if wrote_body:
@@ -634,6 +672,27 @@ class RemoteController:
         if decision.status:
             self.update(case, decision.status, decision.reason)
             return
+        offload_decision = render_offload_flags(
+            self.spec, self.capabilities
+        )
+        if offload_decision.status:
+            self.update(
+                case,
+                offload_decision.status,
+                offload_decision.reason,
+            )
+            return
+        execution = self.spec["execution"]
+        if (
+            int(execution["kv_cache_memory_bytes"]) > 0
+            and not self.capabilities.kv_cache_memory_bytes
+        ):
+            self.update(
+                case,
+                CaseStatus.SKIPPED_UNSUPPORTED,
+                "fixed KV cache memory is not supported by this vLLM CLI",
+            )
+            return
         resource = self.spec["resource"]
         case_state = self.state.cases[case.case_id]
         self.update(case, CaseStatus.WAIT_NPU)
@@ -668,7 +727,9 @@ class RemoteController:
             ]
             case_state.attempts += 1
             self.update(case, CaseStatus.LEASED)
-            self._execute_case(case, decision.flags)
+            self._execute_case(
+                case, decision.flags, offload_decision.flags
+            )
         except Exception as exc:
             service_log = (
                 self.run_dir / "cases" / case.case_id / "service.log"
@@ -704,7 +765,10 @@ class RemoteController:
             lease.release()
 
     def _execute_case(
-        self, case: ParallelCase, parallel_flags: Sequence[str]
+        self,
+        case: ParallelCase,
+        parallel_flags: Sequence[str],
+        offload_flags: Sequence[str],
     ) -> None:
         case_dir = self.run_dir / "cases" / case.case_id
         case_dir.mkdir(parents=True, exist_ok=True)
@@ -713,6 +777,8 @@ class RemoteController:
         command_evidence = {
             "case": case.as_dict(),
             "parallel_flags": list(parallel_flags),
+            "offload": dict(self.spec["offload"]),
+            "offload_flags": list(offload_flags),
             "devices": self.state.cases[case.case_id].devices,
         }
         (case_dir / "command.json").write_text(
@@ -757,14 +823,25 @@ class RemoteController:
             str(model["max_model_len"]),
             "--max-num-seqs",
             str(max(int(value) for value in workload["concurrency"])),
-            "--gpu-memory-utilization",
-            "0.8",
             "--host",
             "0.0.0.0",
             "--port",
             str(port),
             *parallel_flags,
+            *offload_flags,
         ]
+        kv_cache_memory_bytes = int(execution["kv_cache_memory_bytes"])
+        if kv_cache_memory_bytes:
+            command.extend(
+                ["--kv-cache-memory-bytes", str(kv_cache_memory_bytes)]
+            )
+        else:
+            command.extend(
+                [
+                    "--gpu-memory-utilization",
+                    str(execution["gpu_memory_utilization"]),
+                ]
+            )
         if str(execution["execution_mode"]) == "eager":
             command.append("--enforce-eager")
         profile_root = f"{container_run_dir}/profiles/{case.case_id}"
@@ -772,8 +849,8 @@ class RemoteController:
             profile_config = {
                 "profiler": "torch",
                 "torch_profiler_dir": profile_root,
-                "torch_profiler_record_shapes": True,
-                "torch_profiler_with_memory": True,
+                "torch_profiler_record_shapes": False,
+                "torch_profiler_with_memory": False,
                 "torch_profiler_with_stack": False,
             }
             command.extend(
@@ -803,6 +880,12 @@ class RemoteController:
             "HF_HUB_OFFLINE=1",
             "-e",
             "TRANSFORMERS_OFFLINE=1",
+            "-e",
+            "HCCL_NPU_SOCKET_PORT_RANGE="
+            + str(execution["hccl_npu_socket_port_range"]),
+            "-e",
+            "HCCL_HOST_SOCKET_PORT_RANGE="
+            + str(execution["hccl_host_socket_port_range"]),
         ]
         profile_scopes = enabled_profile_scopes(self.spec)
         if case.profile and profile_scopes:
@@ -824,7 +907,17 @@ class RemoteController:
         if launch.returncode:
             raise RuntimeError(launch.stderr.strip() or "docker exec failed")
         try:
-            self._wait_for_health(port, int(execution["startup_timeout_seconds"]))
+            self._wait_for_health(
+                port,
+                int(execution["startup_timeout_seconds"]),
+                container,
+                pid_file,
+                case_dir / "service.log",
+            )
+            self._record_offload_evidence(
+                case_dir / "service.log",
+                str(self.spec["offload"]["backend"]),
+            )
             base_url = f"http://127.0.0.1:{port}"
             prompt_cache = {
                 int(target): build_exact_prompt(
@@ -926,7 +1019,14 @@ class RemoteController:
             self._stop_owned_service(container, pid_file)
 
     @staticmethod
-    def _wait_for_health(port: int, timeout_seconds: int) -> None:
+    def _wait_for_health(
+        port: int,
+        timeout_seconds: int,
+        container: str,
+        pid_file: str,
+        service_log: Path,
+    ) -> None:
+        started = time.monotonic()
         deadline = time.monotonic() + timeout_seconds
         last_error = ""
         while time.monotonic() < deadline:
@@ -938,8 +1038,78 @@ class RemoteController:
                         return
             except (OSError, urllib.error.URLError) as exc:
                 last_error = str(exc)
+            # docker exec -d can return just before the shell writes its PID.
+            # Once that short grace period has passed, a missing/dead PID means
+            # startup has already failed and waiting for the full health timeout
+            # only hides the useful service error.
+            if time.monotonic() - started >= 10:
+                quoted_pid_file = shlex.quote(pid_file)
+                process_check = subprocess.run(
+                    [
+                        "docker",
+                        "exec",
+                        container,
+                        "bash",
+                        "-lc",
+                        f"test -s {quoted_pid_file} && "
+                        f"kill -0 \"$(cat {quoted_pid_file})\"",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if process_check.returncode:
+                    log_tail = ""
+                    if service_log.exists():
+                        log_tail = "\n".join(
+                            service_log.read_text(
+                                encoding="utf-8", errors="replace"
+                            ).splitlines()[-80:]
+                        )
+                    detail = log_tail or (
+                        process_check.stderr.strip()
+                        or "service PID is missing or no longer alive"
+                    )
+                    raise RuntimeError(
+                        "vLLM service exited before its health check passed:\n"
+                        + detail
+                    )
             time.sleep(5)
         raise TimeoutError(f"vLLM health timeout on port {port}: {last_error}")
+
+    @staticmethod
+    def _record_offload_evidence(
+        service_log: Path, backend: str
+    ) -> None:
+        """Persist startup evidence and reject silent offload fallbacks."""
+        if backend == "none":
+            return
+        log_text = service_log.read_text(
+            encoding="utf-8", errors="replace"
+        )
+        matched_lines = [
+            line
+            for line in log_text.splitlines()
+            if re.search(
+                r"prefetchoffloader|weight.*offload|offload.*weight|"
+                r"memory saved|static buffer pool",
+                line,
+                re.I,
+            )
+        ]
+        evidence = {
+            "backend": backend,
+            "verified": bool(matched_lines),
+            "matched_lines": matched_lines[-100:],
+        }
+        (service_log.parent / "offload_evidence.json").write_text(
+            json.dumps(evidence, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        if not matched_lines:
+            raise RuntimeError(
+                "vLLM became healthy but the service log contains no "
+                "weight-offload initialization evidence"
+            )
 
     @staticmethod
     def _find_free_port(base: int, key: str) -> int:
@@ -1172,6 +1342,7 @@ class RemoteController:
             metadata={
                 "run_id": self.run_dir.name,
                 "model": self.spec["model"]["name"],
+                "offload": self.spec["offload"],
             },
         )
 

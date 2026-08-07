@@ -65,11 +65,22 @@
       "AI Core Freq"
     ],
     "scopes": {
-      "forward": true,
-      "prefill": false,
-      "decode": false,
+      "forward": false,
+      "prefill": true,
+      "decode": true,
       "chunked_prefill": false,
-      "spec_decode": false
+      "spec_decode": false,
+      "worker_step": true,
+      "prepare_input": true,
+      "post_process": true,
+      "sample_step": true,
+      "sample_token": true,
+      "draft_token": true,
+      "async_state_update": true,
+      "pp_send_wait": true,
+      "pp_recv_submit": true,
+      "pp_recv_wait": true,
+      "pp_send_submit": true
     }
   },
   "resource": {

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -13,14 +14,29 @@ from typing import Any, Mapping
 
 DEFAULT_MODEL_PATH = "/home/vllm/l00977701/models/Qwen3-30B-A3B"
 MAX_ASCEND_DIES = 16
-PROFILE_SCOPE_NAMES = (
+MODEL_PHASE_SCOPE_NAMES = (
     "forward",
     "prefill",
     "decode",
     "chunked_prefill",
     "spec_decode",
 )
+PYTHON_SCOPE_NAMES = (
+    "worker_step",
+    "prepare_input",
+    "post_process",
+    "sample_step",
+    "sample_token",
+    "draft_token",
+    "async_state_update",
+    "pp_send_wait",
+    "pp_recv_submit",
+    "pp_recv_wait",
+    "pp_send_submit",
+)
+PROFILE_SCOPE_NAMES = MODEL_PHASE_SCOPE_NAMES + PYTHON_SCOPE_NAMES
 TRACE_MODES = ("full", "scopes_only")
+OFFLOAD_BACKENDS = ("none", "prefetch")
 
 
 @dataclass(frozen=True)
@@ -56,6 +72,8 @@ class CapabilitySet:
     context_parallel_flag: str | None
     profiler_config: bool
     kv_cache_memory_bytes: bool
+    prefetch_offload: bool
+    offload_params: bool
 
     @classmethod
     def from_help_text(cls, text: str) -> "CapabilitySet":
@@ -76,6 +94,16 @@ class CapabilitySet:
             context_parallel_flag=cp_flag,
             profiler_config="--profiler-config" in lowered,
             kv_cache_memory_bytes="--kv-cache-memory-bytes" in lowered,
+            prefetch_offload=all(
+                flag in lowered
+                for flag in (
+                    "--offload-backend",
+                    "--offload-group-size",
+                    "--offload-num-in-group",
+                    "--offload-prefetch-step",
+                )
+            ),
+            offload_params="--offload-params" in lowered,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -84,6 +112,8 @@ class CapabilitySet:
             "context_parallel_flag": self.context_parallel_flag,
             "profiler_config": self.profiler_config,
             "kv_cache_memory_bytes": self.kv_cache_memory_bytes,
+            "prefetch_offload": self.prefetch_offload,
+            "offload_params": self.offload_params,
         }
 
 
@@ -104,6 +134,7 @@ def default_spec() -> dict[str, Any]:
         },
         "container": {
             "name": "qwen3_parallel_nightly",
+            "image": "quay.io/ascend/vllm-ascend:nightly-main-a3",
             "expected_vllm_version": "",
             "expected_vllm_ascend_version": "",
         },
@@ -132,9 +163,16 @@ def default_spec() -> dict[str, Any]:
             "output_tokens": 64,
             "num_requests": 16,
             "concurrency": 4,
-            "trace_mode": "full",
+            "trace_mode": "scopes_only",
             "exclude_tracks": [],
             "scopes": {name: True for name in PROFILE_SCOPE_NAMES},
+        },
+        "offload": {
+            "backend": "none",
+            "group_size": 0,
+            "num_in_group": 1,
+            "prefetch_step": 1,
+            "params": [],
         },
         "resource": {
             "max_dies": MAX_ASCEND_DIES,
@@ -149,8 +187,12 @@ def default_spec() -> dict[str, Any]:
             "port_base": 18000,
             "max_retries": 2,
             "startup_timeout_seconds": 900,
+            "hccl_npu_socket_port_range": "auto",
+            "hccl_host_socket_port_range": "auto",
             "execution_mode": "aclgraph",
             "distributed_executor_backend": "mp",
+            "gpu_memory_utilization": 0.8,
+            "kv_cache_memory_bytes": 0,
             "profile_policy": "representative_and_boundary",
             "allow_service_mutation": True,
         },
@@ -218,12 +260,76 @@ def validate_spec(spec: Mapping[str, Any]) -> None:
         raise ValueError(
             "profiling.exclude_tracks must be a list of non-empty strings"
         )
+    offload = spec["offload"]
+    backend = str(offload["backend"])
+    if backend not in OFFLOAD_BACKENDS:
+        raise ValueError(
+            f"offload.backend must be one of {OFFLOAD_BACKENDS}, "
+            f"got {backend!r}"
+        )
+    group_size = int(offload["group_size"])
+    num_in_group = int(offload["num_in_group"])
+    prefetch_step = int(offload["prefetch_step"])
+    params = offload["params"]
+    if not isinstance(params, list) or any(
+        not isinstance(name, str) or not name.strip() for name in params
+    ):
+        raise ValueError(
+            "offload.params must be a list of non-empty strings"
+        )
+    if backend == "prefetch":
+        if group_size < 1:
+            raise ValueError(
+                "offload.group_size must be positive for prefetch"
+            )
+        if not 1 <= num_in_group <= group_size:
+            raise ValueError(
+                "offload.num_in_group must be in [1, group_size]"
+            )
+        if prefetch_step < 1:
+            raise ValueError(
+                "offload.prefetch_step must be positive for prefetch"
+            )
+    elif group_size != 0:
+        raise ValueError(
+            "offload.group_size must be 0 when offload is disabled"
+        )
+    execution = spec["execution"]
+    gpu_memory_utilization = float(execution["gpu_memory_utilization"])
+    if not 0 < gpu_memory_utilization <= 1:
+        raise ValueError(
+            "execution.gpu_memory_utilization must be in (0, 1]"
+        )
+    if int(execution["kv_cache_memory_bytes"]) < 0:
+        raise ValueError(
+            "execution.kv_cache_memory_bytes must be non-negative"
+        )
+    hccl_port_pattern = re.compile(
+        r"^(?:auto|\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*)$"
+    )
+    for field in (
+        "hccl_npu_socket_port_range",
+        "hccl_host_socket_port_range",
+    ):
+        value = str(execution[field])
+        if not hccl_port_pattern.fullmatch(value):
+            raise ValueError(
+                f"execution.{field} must be 'auto' or an HCCL port list/range"
+            )
 
 
 def enabled_profile_scopes(spec: Mapping[str, Any]) -> tuple[str, ...]:
     """Return enabled high-level trace scopes in deterministic order."""
     scopes = spec["profiling"]["scopes"]
     return tuple(name for name in PROFILE_SCOPE_NAMES if scopes[name])
+
+
+def enabled_model_phase_scopes(
+    spec: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return enabled scopes used to classify model forward passes."""
+    scopes = spec["profiling"]["scopes"]
+    return tuple(name for name in MODEL_PHASE_SCOPE_NAMES if scopes[name])
 
 
 def expand_quick_matrix(spec: Mapping[str, Any]) -> list[ParallelCase]:
@@ -321,6 +427,44 @@ def render_parallel_flags(
                 "context parallel is not supported by this vLLM CLI",
             )
         flags.extend([capabilities.context_parallel_flag, str(cp)])
+    return FlagDecision(tuple(flags))
+
+
+def render_offload_flags(
+    spec: Mapping[str, Any],
+    capabilities: CapabilitySet,
+) -> FlagDecision:
+    """Render validated weight-offload flags for the vLLM CLI."""
+    offload = spec["offload"]
+    backend = str(offload["backend"])
+    if backend == "none":
+        return FlagDecision(())
+    if not capabilities.prefetch_offload:
+        return FlagDecision(
+            (),
+            "SKIPPED_UNSUPPORTED",
+            "prefetch weight offload is not supported by this vLLM CLI",
+        )
+    params = tuple(str(name) for name in offload["params"])
+    if params and not capabilities.offload_params:
+        return FlagDecision(
+            (),
+            "SKIPPED_UNSUPPORTED",
+            "selective offload parameters are not supported by this vLLM CLI",
+        )
+    flags = [
+        "--offload-backend",
+        "prefetch",
+        "--offload-group-size",
+        str(offload["group_size"]),
+        "--offload-num-in-group",
+        str(offload["num_in_group"]),
+        "--offload-prefetch-step",
+        str(offload["prefetch_step"]),
+    ]
+    if params:
+        flags.append("--offload-params")
+        flags.extend(params)
     return FlagDecision(tuple(flags))
 
 

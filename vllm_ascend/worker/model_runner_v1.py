@@ -128,6 +128,7 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
+from vllm_ascend.profiler.semantic_scopes import semantic_profile_context
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
@@ -205,13 +206,6 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
-ENABLED_FORWARD_PROFILE_SCOPES = frozenset(
-    scope.strip()
-    for scope in envs_ascend.VLLM_ASCEND_PROFILING_SCOPES.split(",")
-    if scope.strip()
-)
-
-
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -266,12 +260,6 @@ def _forward_profile_scope(attn_state: AscendAttentionState | None) -> str:
     ):
         return "prefill"
     return "unknown_forward_stage"
-
-
-def _forward_profile_context(scope: str):
-    if scope not in ENABLED_FORWARD_PROFILE_SCOPES:
-        return nullcontext()
-    return record_function_or_nullcontext(scope)
 
 
 class ExecuteModelState(NamedTuple):
@@ -1997,7 +1985,7 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        with record_function_or_nullcontext("prepare input"):
+        with semantic_profile_context("prepare_input"):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
                 # in the previous sample_tokens step. If a request has
@@ -2267,8 +2255,8 @@ class NPUModelRunner(GPUModelRunner):
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
         with (
-            _forward_profile_context("forward"),
-            _forward_profile_context(_forward_profile_scope(self.attn_state)),
+            semantic_profile_context("forward"),
+            semantic_profile_context(_forward_profile_scope(self.attn_state)),
             set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -2296,7 +2284,7 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-        with record_function_or_nullcontext("post process"):
+        with semantic_profile_context("post_process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
@@ -2430,7 +2418,7 @@ class NPUModelRunner(GPUModelRunner):
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
-        with record_function_or_nullcontext("sample_token"):
+        with semantic_profile_context("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self.need_accepted_tokens:
@@ -2475,7 +2463,7 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
         )
 
-        with record_function_or_nullcontext("draft_token"):
+        with semantic_profile_context("draft_token"):
             if self.speculative_config:
                 use_padded_batch = (
                     self.speculative_config
@@ -2526,7 +2514,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.need_accepted_tokens:
             assert self.sampling_done_event is not None
             with (
-                record_function_or_nullcontext("async_state_update"),
+                semantic_profile_context("async_state_update"),
                 torch.npu.stream(global_stream()),
             ):
                 global_stream().wait_event(self.sampling_done_event)

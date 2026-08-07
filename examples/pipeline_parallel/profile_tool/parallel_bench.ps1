@@ -16,6 +16,7 @@ param(
     [string]$RemoteProject = "/home/vllm/l00977701/pipeline_parallel",
     [string]$RemoteRunRoot = "/home/vllm/l00977701/runtime/parallel_bench_runs",
     [string]$Container = "qwen3_parallel_nightly",
+    [string]$Image = "quay.io/ascend/vllm-ascend:nightly-main-a3",
     [string]$Model = "/home/vllm/l00977701/models/Qwen3-30B-A3B",
     [ValidateSet("moe", "dense", "auto")]
     [string]$ModelKind = "moe",
@@ -162,6 +163,9 @@ if ($null -ne $containerConfig) {
     if (-not (Test-ExplicitParameter "Container")) {
         $Container = [string](Get-OptionalProperty $containerConfig "name" $Container)
     }
+    if (-not (Test-ExplicitParameter "Image")) {
+        $Image = [string](Get-OptionalProperty $containerConfig "image" $Image)
+    }
     if (-not (Test-ExplicitParameter "ExpectedVllmVersion")) {
         $ExpectedVllmVersion = [string](
             Get-OptionalProperty $containerConfig "expected_vllm_version" ""
@@ -282,6 +286,9 @@ if ($Model -notmatch "^/[A-Za-z0-9._/-]+$") {
 if ($Container -notmatch "^[A-Za-z0-9][A-Za-z0-9_.-]*$") {
     throw "container.name contains unsafe characters."
 }
+if ($Image -notmatch "^[A-Za-z0-9][A-Za-z0-9._/:@-]*$") {
+    throw "container.image contains unsafe characters."
+}
 
 $target = "${SshUser}@${Server}"
 $remoteTool = "$RemoteProject/profile_tool"
@@ -315,6 +322,7 @@ $spec.server | Add-Member -Force -NotePropertyName "host" -NotePropertyValue $Se
 $spec.server | Add-Member -Force -NotePropertyName "ssh_user" -NotePropertyValue $SshUser
 $spec.server | Add-Member -Force -NotePropertyName "remote_root" -NotePropertyValue $RemoteRunRoot
 $spec.container | Add-Member -Force -NotePropertyName "name" -NotePropertyValue $Container
+$spec.container | Add-Member -Force -NotePropertyName "image" -NotePropertyValue $Image
 $spec.container | Add-Member -Force -NotePropertyName "expected_vllm_version" `
     -NotePropertyValue $ExpectedVllmVersion
 $spec.container | Add-Member -Force -NotePropertyName "expected_vllm_ascend_version" `
@@ -380,7 +388,11 @@ $connectionOptions = @(
     "-o", "ServerAliveCountMax=$SshServerAliveCountMax"
 )
 $sshArgs = @("-p", "$SshPort") + $connectionOptions
-$scpArgs = @("-P", "$SshPort") + $connectionOptions
+# OpenSSH 9+ uses SFTP for scp by default. Some benchmark hosts expose an
+# interactive SSH shell but do not configure the SFTP subsystem, which closes
+# the upload immediately with exit code 255. The payload is a regular tar file,
+# so the legacy SCP wire protocol is sufficient and more widely compatible.
+$scpArgs = @("-O", "-P", "$SshPort") + $connectionOptions
 if ($multiplexing) {
     $identity = [Text.Encoding]::UTF8.GetBytes("$target-$SshPort-$PID")
     $hasher = [Security.Cryptography.SHA256]::Create()
@@ -453,6 +465,13 @@ function Invoke-Scp {
     Write-Host "  -> $Operation"
     & scp @scpArgs @Arguments
     if ($LASTEXITCODE -ne 0) {
+        if ($LASTEXITCODE -eq 255) {
+            Write-Host (
+                "SCP connection closed. The script already forced the " +
+                "legacy SCP protocol; verify the SSH password, sshd " +
+                "MaxSessions/AllowUsers policy, and available space in /tmp."
+            )
+        }
         throw "$Operation failed with exit code $LASTEXITCODE."
     }
 }
@@ -591,6 +610,24 @@ try {
 
         $remoteArchive = "/tmp/$RunId-submit.tar"
         $remoteUpload = "$remoteRun/.submit-upload"
+        $profilePolicy = [string](
+            Get-OptionalProperty $spec.execution "profile_policy" "representative_and_boundary"
+        )
+        $explicitCases = @($spec.matrix.cases)
+        $hasProfileCase = @(
+            $explicitCases | Where-Object { [bool]$_.profile }
+        ).Count -gt 0
+        $installProfileScopes = (
+            $profilePolicy -ne "none" -and
+            ($explicitCases.Count -eq 0 -or $hasProfileCase)
+        )
+        $profileInstallCommand = if ($installProfileScopes) {
+            "echo '[remote 2/3] Installing high-level profiling scopes'; " +
+            "docker exec '$Container' python3 " +
+            "'/workspace/pipeline_parallel/profile_tool/install_profile_scopes.py'; "
+        } else {
+            "echo '[remote 2/3] Profiling disabled; skipping scope installation'; "
+        }
         Write-Host "[1/3] Uploading one bundled payload (password prompt 1/2) ..."
         Invoke-Scp -Arguments @($temporaryArchive, "${target}:$remoteArchive") `
             -Operation "uploading bundled benchmark payload"
@@ -606,10 +643,9 @@ try {
             "cp -f '$remoteUpload/spec.json' '$remoteSpec'; rm -rf '$remoteUpload'; " +
             "chmod +x '$RemoteProject/find_idle_npu.sh' '$remoteDocker'; " +
             "echo '[remote 2/3] Recreating the test container'; " +
-            "CONTAINER_NAME='$Container' MODEL_DIR='$Model' '$remoteDocker' restart; " +
-            "echo '[remote 2/3] Installing high-level profiling scopes'; " +
-            "docker exec '$Container' python3 " +
-            "'/workspace/pipeline_parallel/profile_tool/install_profile_scopes.py'; " +
+            "IMAGE='$Image' CONTAINER_NAME='$Container' MODEL_DIR='$Model' " +
+            "'$remoteDocker' restart; " +
+            $profileInstallCommand +
             "echo '[remote 3/3] Launching the detached controller'; " +
             "cd '$remoteTool'; " +
             "nohup python3 '$remoteController' --run-dir '$remoteRun' --spec '$remoteSpec' " +
